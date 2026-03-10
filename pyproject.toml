@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "YD-Vector"
+version = "0.1.0"
+description = "From-scratch SVG foundation model training and inference toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "YD-Vector Contributors" }
+]
+dependencies = [
+  "torch",
+  "tqdm",
+  "pyyaml",
+  "numpy",
+  "regex",
+  "pillow"
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["yd_vector*"]

@@ -1,0 +1,27 @@
+run_name: "yd_vector_small"
+seed: 42
+device: "auto"
+num_workers: 0
+manifest_path: "data_local/manifest/manifest.jsonl"
+splits_path: "data_local/manifest/splits.json"
+batch_size: 6
+grad_accum_steps: 1
+max_seq_len: 2048
+lr: 0.0003
+weight_decay: 0.01
+warmup_steps: 200
+max_steps: 20000
+eval_every: 1000
+save_every: 1000
+log_every: 20
+max_eval_batches: 20
+amp: true
+tokenizer:
+  type: "byte"
+  vocab_path: "data_local/manifest/vocab_byte.json"
+  vocab_size: 260
+  bpe_sample_size: 50000
+cache:
+  enabled: true
+  dir: "data_local/cache"
+  truncate_chars: 200000

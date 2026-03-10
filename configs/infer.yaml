@@ -1,0 +1,7 @@
+checkpoint_path: "outputs/runs/yd_vector_small/checkpoints/step_00020000/model.pt"
+vocab_path: "outputs/runs/yd_vector_small/checkpoints/step_00020000/tokenizer.json"
+output_dir: "outputs/runs/yd_vector_small/infer_outputs_20000"
+max_new_tokens: 2048
+temperature: 0.2
+top_p: 0.7
+prompt_svg_prefix: "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'>"
