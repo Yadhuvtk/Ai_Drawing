@@ -1,0 +1,13 @@
+vocab_size: 260
+d_model: 384
+n_layers: 6
+n_heads: 6
+d_ff: 1536
+dropout: 0.1
+max_seq_len: 1024
+rope: true
+tie_embeddings: true
+norm_type: "rmsnorm"
+use_vision: true
+image_size: 256
+vision_prefix_tokens: 16

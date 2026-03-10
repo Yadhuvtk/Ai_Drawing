@@ -18,7 +18,9 @@ dependencies = [
   "pyyaml",
   "numpy",
   "regex",
-  "pillow"
+  "pillow",
+  "fastapi",
+  "uvicorn"
 ]
 
 [tool.setuptools]
