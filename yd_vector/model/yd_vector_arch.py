@@ -70,9 +70,7 @@ class YDVectorForCausalLM(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones((bsz, seq_len), dtype=torch.long, device=input_ids.device)
 
-        if self.use_vision:
-            if pixel_values is None:
-                raise ValueError("pixel_values are required when config.use_vision is true")
+        if self.use_vision and pixel_values is not None:
             assert self.vision_encoder is not None
             assert self.vision_adapter is not None
             vision_features = self.vision_encoder(pixel_values)
