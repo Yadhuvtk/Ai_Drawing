@@ -125,18 +125,18 @@ class YDVectorForCausalLM(nn.Module):
     def generate(
         self,
         input_ids: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
         max_new_tokens: int = 128,
         temperature: float = 1.0,
         top_p: float = 0.9,
         eos_token_id: int = 2,
+        pixel_values: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return generate_tokens(
             model=self,
             input_ids=input_ids,
-            pixel_values=pixel_values,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             eos_token_id=eos_token_id,
+            pixel_values=pixel_values,
         )

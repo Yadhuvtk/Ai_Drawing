@@ -23,11 +23,11 @@ def _sample_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
 def generate_tokens(
     model,
     input_ids: torch.Tensor,
-    pixel_values: torch.Tensor | None = None,
     max_new_tokens: int = 128,
     temperature: float = 1.0,
     top_p: float = 0.9,
     eos_token_id: int = 2,
+    pixel_values: torch.Tensor | None = None,
 ) -> torch.Tensor:
     was_training = model.training
     model.eval()
