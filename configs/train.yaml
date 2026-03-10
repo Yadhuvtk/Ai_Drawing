@@ -1,9 +1,12 @@
 run_name: "yd_vector_small"
+task: "svg"
 seed: 42
 device: "auto"
 num_workers: 0
 manifest_path: "data_local/manifest/manifest.jsonl"
 splits_path: "data_local/manifest/splits.json"
+im2svg_manifest_path: "data_local/manifest/im2svg_manifest_256.jsonl"
+im2svg_splits_path: "data_local/manifest/im2svg_splits.json"
 batch_size: 6
 grad_accum_steps: 1
 max_seq_len: 2048

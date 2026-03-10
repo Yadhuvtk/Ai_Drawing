@@ -8,3 +8,6 @@ max_seq_len: 1024
 rope: true
 tie_embeddings: true
 norm_type: "rmsnorm"
+use_vision: false
+image_size: 256
+vision_prefix_tokens: 4

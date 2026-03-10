@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 
 from yd_vector.data.collate import causal_lm_collate
 from yd_vector.data.dataset import SVGIterableDataset, count_split_records
+from yd_vector.data.im2svg_collate import im2svg_collate_fn
+from yd_vector.data.im2svg_dataset import IM2SVGDataset
 from yd_vector.data.svg_tokenizer import build_tokenizer
 from yd_vector.model.config import ModelConfig
 from yd_vector.model.yd_vector_arch import YDVectorForCausalLM
@@ -31,6 +33,20 @@ def _resolve_cfg_paths(train_cfg_path: str | Path, model_cfg_path: str | Path | 
     if data_cfg_path is None:
         data_cfg_path = cfg_dir / "data.yaml"
     return Path(model_cfg_path), Path(data_cfg_path)
+
+
+def _resolve_repo_path(path_value: str | Path | None) -> Path | None:
+    if path_value in (None, ""):
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
+def _use_im2svg(train_cfg: Dict[str, Any], model_cfg: Dict[str, Any]) -> bool:
+    task = str(train_cfg.get("task", "")).strip().lower()
+    return task == "im2svg" or bool(model_cfg.get("use_vision", False))
 
 
 def _select_device(device_name: str) -> torch.device:
@@ -78,6 +94,9 @@ def run_training(
     model_cfg_path, data_cfg_path = _resolve_cfg_paths(train_config_path, model_config_path, data_config_path)
     model_cfg = load_yaml(model_cfg_path)
     data_cfg = load_yaml(data_cfg_path)
+    use_im2svg = _use_im2svg(train_cfg, model_cfg)
+    if use_im2svg:
+        model_cfg["use_vision"] = True
 
     run_name = str(train_cfg.get("run_name", "yd_vector_run"))
     run_dir = ensure_dir(REPO_ROOT / "outputs" / "runs" / run_name)
@@ -87,24 +106,37 @@ def run_training(
     device = _select_device(str(train_cfg.get("device", "auto")))
     logger.info("Run: %s | device=%s", run_name, device)
 
-    manifest_path = Path(train_cfg["manifest_path"])
-    if not manifest_path.is_absolute():
-        manifest_path = REPO_ROOT / manifest_path
-    if not manifest_path.exists():
+    manifest_path = _resolve_repo_path(train_cfg.get("manifest_path"))
+    if manifest_path is not None and not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-    splits_path = Path(train_cfg.get("splits_path", ""))
-    if splits_path and not splits_path.is_absolute():
-        splits_path = REPO_ROOT / splits_path
-    if splits_path.exists():
+    splits_path = _resolve_repo_path(train_cfg.get("splits_path"))
+    if splits_path is not None and splits_path.exists():
         logger.info("Split metadata: %s", read_json(splits_path).get("counts", {}))
+
+    im2svg_manifest_path = None
+    im2svg_splits_path = None
+    if use_im2svg:
+        im2svg_manifest_path = _resolve_repo_path(
+            train_cfg.get("im2svg_manifest_path", "data_local/manifest/im2svg_manifest_256.jsonl")
+        )
+        im2svg_splits_path = _resolve_repo_path(
+            train_cfg.get("im2svg_splits_path", "data_local/manifest/im2svg_splits.json")
+        )
+        if im2svg_manifest_path is None or not im2svg_manifest_path.exists():
+            raise FileNotFoundError(f"IM2SVG manifest not found: {im2svg_manifest_path}")
+        if im2svg_splits_path is None or not im2svg_splits_path.exists():
+            raise FileNotFoundError(f"IM2SVG splits not found: {im2svg_splits_path}")
+        logger.info("IM2SVG split metadata: %s", read_json(im2svg_splits_path).get("counts", {}))
+    elif manifest_path is None:
+        raise ValueError("manifest_path is required for SVG-only training")
 
     tok_cfg = dict(train_cfg.get("tokenizer", {}))
     if tok_cfg.get("vocab_path"):
         vp = Path(tok_cfg["vocab_path"])
         if not vp.is_absolute():
             tok_cfg["vocab_path"] = str(REPO_ROOT / vp)
-    tokenizer = build_tokenizer(tok_cfg, manifest_path=str(manifest_path))
+    tokenizer = build_tokenizer(tok_cfg, manifest_path=str(manifest_path) if manifest_path is not None else None)
 
     model_cfg["vocab_size"] = tokenizer.vocab_size
     model = YDVectorForCausalLM(ModelConfig.from_dict(model_cfg)).to(device)
@@ -131,31 +163,59 @@ def run_training(
     min_chars = int(data_cfg.get("min_chars", 20))
     truncate_chars = int(cache_cfg.get("truncate_chars", data_cfg.get("truncate_chars", 200000)))
 
-    train_dataset = SVGIterableDataset(
-        manifest_path=manifest_path,
-        tokenizer=tokenizer,
-        split="train",
-        max_seq_len=max_seq_len,
-        max_file_bytes=max_file_bytes,
-        min_chars=min_chars,
-        truncate_chars=truncate_chars,
-        cache_dir=cache_dir,
-        cache_enabled=cache_enabled,
-        repeat=True,
-    )
-    val_dataset = SVGIterableDataset(
-        manifest_path=manifest_path,
-        tokenizer=tokenizer,
-        split="val",
-        max_seq_len=max_seq_len,
-        max_file_bytes=max_file_bytes,
-        min_chars=min_chars,
-        truncate_chars=truncate_chars,
-        cache_dir=cache_dir,
-        cache_enabled=cache_enabled,
-        repeat=False,
-        max_records=max_eval_batches * batch_size * 2,
-    )
+    if use_im2svg:
+        image_size = int(model_cfg.get("image_size", 256))
+        train_dataset = IM2SVGDataset(
+            manifest_path=im2svg_manifest_path,
+            splits_path=im2svg_splits_path,
+            tokenizer=tokenizer,
+            split="train",
+            image_size=image_size,
+            max_seq_len=max_seq_len,
+            max_file_bytes=max_file_bytes,
+            min_chars=min_chars,
+            truncate_chars=truncate_chars,
+        )
+        val_dataset = IM2SVGDataset(
+            manifest_path=im2svg_manifest_path,
+            splits_path=im2svg_splits_path,
+            tokenizer=tokenizer,
+            split="val",
+            image_size=image_size,
+            max_seq_len=max_seq_len,
+            max_file_bytes=max_file_bytes,
+            min_chars=min_chars,
+            truncate_chars=truncate_chars,
+            max_records=max_eval_batches * batch_size * 2,
+        )
+        collate_fn = im2svg_collate_fn
+    else:
+        train_dataset = SVGIterableDataset(
+            manifest_path=manifest_path,
+            tokenizer=tokenizer,
+            split="train",
+            max_seq_len=max_seq_len,
+            max_file_bytes=max_file_bytes,
+            min_chars=min_chars,
+            truncate_chars=truncate_chars,
+            cache_dir=cache_dir,
+            cache_enabled=cache_enabled,
+            repeat=True,
+        )
+        val_dataset = SVGIterableDataset(
+            manifest_path=manifest_path,
+            tokenizer=tokenizer,
+            split="val",
+            max_seq_len=max_seq_len,
+            max_file_bytes=max_file_bytes,
+            min_chars=min_chars,
+            truncate_chars=truncate_chars,
+            cache_dir=cache_dir,
+            cache_enabled=cache_enabled,
+            repeat=False,
+            max_records=max_eval_batches * batch_size * 2,
+        )
+        collate_fn = lambda b: causal_lm_collate(b, pad_token_id=tokenizer.pad_token_id)
 
     num_workers = int(train_cfg.get("num_workers", 0))
     pin_memory = device.type == "cuda"
@@ -163,7 +223,7 @@ def run_training(
         train_dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=lambda b: causal_lm_collate(b, pad_token_id=tokenizer.pad_token_id),
+        collate_fn=collate_fn,
         pin_memory=pin_memory,
     )
 
@@ -187,8 +247,13 @@ def run_training(
         if latest.exists():
             shutil.rmtree(latest)
 
-    train_count = count_split_records(manifest_path, split="train")
-    val_count = count_split_records(manifest_path, split="val")
+    if use_im2svg:
+        split_meta = read_json(im2svg_splits_path)
+        train_count = int(split_meta.get("counts", {}).get("train", len(train_dataset)))
+        val_count = int(split_meta.get("counts", {}).get("val", len(val_dataset)))
+    else:
+        train_count = count_split_records(manifest_path, split="train")
+        val_count = count_split_records(manifest_path, split="val")
     logger.info("Dataset counts | train=%d val=%d", train_count, val_count)
     if train_count == 0:
         raise RuntimeError("No train samples found in manifest.")
@@ -209,9 +274,17 @@ def run_training(
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
+            pixel_values = batch.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values = pixel_values.to(device, non_blocking=True)
 
             with autocast_context(use_amp):
-                loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss, _ = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    pixel_values=pixel_values,
+                )
                 if loss is None:
                     raise RuntimeError("Model did not return loss for training batch.")
                 loss = loss / grad_accum_steps
@@ -249,7 +322,7 @@ def run_training(
                 val_dataset,
                 batch_size=batch_size,
                 num_workers=0,
-                collate_fn=lambda b: causal_lm_collate(b, pad_token_id=tokenizer.pad_token_id),
+                collate_fn=collate_fn,
                 pin_memory=pin_memory,
             )
             metrics = evaluate(model, val_loader, device=device, tokenizer=tokenizer, max_batches=max_eval_batches)

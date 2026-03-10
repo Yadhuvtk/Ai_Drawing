@@ -23,6 +23,7 @@ def _sample_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
 def generate_tokens(
     model,
     input_ids: torch.Tensor,
+    pixel_values: torch.Tensor | None = None,
     max_new_tokens: int = 128,
     temperature: float = 1.0,
     top_p: float = 0.9,
@@ -40,7 +41,7 @@ def generate_tokens(
         if ctx.size(1) > model.config.max_seq_len:
             ctx = ctx[:, -model.config.max_seq_len :]
         attention_mask = torch.ones_like(ctx, dtype=torch.long, device=ctx.device)
-        _, logits = model(ctx, attention_mask=attention_mask, labels=None)
+        _, logits = model(ctx, attention_mask=attention_mask, labels=None, pixel_values=pixel_values)
         next_logits = logits[:, -1, :]
 
         greedy = temperature == 0.0 or top_p == 0.0

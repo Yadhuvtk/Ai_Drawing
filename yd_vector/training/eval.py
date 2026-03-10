@@ -26,8 +26,16 @@ def evaluate(
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
+        pixel_values = batch.get("pixel_values")
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(device, non_blocking=True)
 
-        loss, logits = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss, logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            pixel_values=pixel_values,
+        )
         if loss is not None:
             losses.append(float(loss.item()))
 

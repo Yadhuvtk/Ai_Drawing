@@ -9,7 +9,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import numpy as np
 import torch
+from PIL import Image
 
 from yd_vector.data.svg_tokenizer import load_tokenizer
 from yd_vector.inference.postprocess import ensure_svg_wrapped
@@ -26,6 +28,22 @@ def _load_prompt(args, cfg) -> str:
     if args.prompt is not None:
         return args.prompt
     return str(cfg.get("prompt_svg_prefix", "<svg>"))
+
+
+def _load_image_tensor(path_value: str | Path, image_size: int, device: torch.device) -> torch.Tensor:
+    image_path = Path(path_value)
+    if not image_path.is_absolute():
+        image_path = REPO_ROOT / image_path
+    if not image_path.exists():
+        raise FileNotFoundError(f"image not found: {image_path}")
+
+    img = Image.open(image_path).convert("RGB")
+    if img.size != (image_size, image_size):
+        img = img.resize((image_size, image_size), Image.BICUBIC)
+
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    return torch.from_numpy(arr).unsqueeze(0).to(device=device)
 
 
 def _select_device() -> torch.device:
@@ -53,6 +71,7 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/infer.yaml")
     parser.add_argument("--prompt", type=str, default=None)
     parser.add_argument("--prompt_file", type=str, default=None)
+    parser.add_argument("--image", type=str, default=None, help="Path to a conditioning image for image-to-SVG models.")
     parser.add_argument("--greedy", action="store_true", help="Use greedy decoding (temperature=0, top_p=0).")
     args = parser.parse_args()
 
@@ -92,6 +111,14 @@ def main() -> None:
     prompt = _load_prompt(args, cfg)
     input_ids = tokenizer.encode(prompt, add_bos=True, add_eos=False, max_length=config.max_seq_len)
     x = torch.tensor([input_ids], dtype=torch.long, device=device)
+    image_path = args.image if args.image is not None else cfg.get("image_path", "")
+    pixel_values = None
+    if config.use_vision:
+        if not image_path:
+            raise ValueError("An image path is required for inference when config.use_vision is true")
+        pixel_values = _load_image_tensor(image_path, image_size=config.image_size, device=device)
+    elif image_path:
+        raise ValueError("An image path was provided, but the loaded model config does not enable vision conditioning")
 
     max_new_tokens = int(cfg.get("max_new_tokens", 256))
     temperature = float(cfg.get("temperature", 1.0))
@@ -102,6 +129,7 @@ def main() -> None:
 
     out_ids = model.generate(
         input_ids=x,
+        pixel_values=pixel_values,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,

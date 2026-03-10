@@ -1,6 +1,7 @@
 checkpoint_path: "outputs/runs/yd_vector_small/checkpoints/step_00020000/model.pt"
 vocab_path: "outputs/runs/yd_vector_small/checkpoints/step_00020000/tokenizer.json"
 output_dir: "outputs/runs/yd_vector_small/infer_outputs_20000"
+image_path: ""
 max_new_tokens: 2048
 temperature: 0.2
 top_p: 0.7
