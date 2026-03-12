@@ -16,7 +16,7 @@ from yd_vector.model.config import ModelConfig
 from yd_vector.model.yd_vector_arch import YDVectorForCausalLM
 from yd_vector.paths import REPO_ROOT, ensure_dir
 from yd_vector.training.amp import autocast_context, build_scaler
-from yd_vector.training.checkpointing import load_latest_checkpoint, save_checkpoint
+from yd_vector.training.checkpointing import load_checkpoint_weights, load_latest_checkpoint, save_checkpoint
 from yd_vector.training.eval import evaluate
 from yd_vector.training.optim import build_optimizer, build_scheduler
 from yd_vector.utils.io import dump_yaml, load_yaml, read_json
@@ -140,6 +140,8 @@ def run_training(
 
     model_cfg["vocab_size"] = tokenizer.vocab_size
     model = YDVectorForCausalLM(ModelConfig.from_dict(model_cfg)).to(device)
+    init_checkpoint_path = _resolve_repo_path(train_cfg.get("init_checkpoint_path"))
+    init_ignore_prefixes = [str(prefix) for prefix in train_cfg.get("init_ignore_prefixes", [])]
 
     lr = float(train_cfg.get("lr", 3e-4))
     wd = float(train_cfg.get("weight_decay", 0.01))
@@ -236,16 +238,39 @@ def run_training(
 
     global_step = 0
     best_val = None
+    resumed = False
     if not fresh:
         state = load_latest_checkpoint(run_dir, model, optimizer=optimizer, scaler=scaler, map_location=device)
         if state is not None:
             global_step = int(state.get("step", 0))
             best_val = state.get("best_val")
+            resumed = True
             logger.info("Resumed from checkpoint/latest at step=%d", global_step)
     else:
         latest = run_dir / "checkpoints" / "latest"
         if latest.exists():
             shutil.rmtree(latest)
+
+    if not resumed and init_checkpoint_path is not None:
+        init_state = load_checkpoint_weights(
+            init_checkpoint_path,
+            model,
+            map_location=device,
+            ignore_prefixes=init_ignore_prefixes,
+        )
+        logger.info(
+            "Initialized model from %s | loaded=%d ignored=%d mismatched=%d missing=%d unexpected=%d",
+            init_checkpoint_path,
+            init_state["loaded_count"],
+            init_state["ignored_count"],
+            init_state["shape_mismatch_count"],
+            init_state["missing_count"],
+            init_state["unexpected_count"],
+        )
+        if init_state["ignored_keys"]:
+            logger.info("Ignored init key sample: %s", init_state["ignored_keys"][:5])
+        if init_state["shape_mismatch_keys"]:
+            logger.info("Shape-mismatch init key sample: %s", init_state["shape_mismatch_keys"][:5])
 
     if use_im2svg:
         split_meta = read_json(im2svg_splits_path)

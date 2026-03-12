@@ -1,0 +1,28 @@
+run_name: "im2svg_curriculum_tiny"
+task: "im2svg"
+seed: 42
+device: "auto"
+num_workers: 0
+manifest_path: "data_local/curriculum_stage1/manifest/manifest.jsonl"
+splits_path: "data_local/curriculum_stage1/manifest/splits.json"
+im2svg_manifest_path: "data_local/curriculum_stage1/manifest/im2svg_manifest_128.jsonl"
+im2svg_splits_path: "data_local/curriculum_stage1/manifest/im2svg_splits.json"
+batch_size: 8
+grad_accum_steps: 1
+max_seq_len: 256
+lr: 0.0008
+weight_decay: 0.0
+warmup_steps: 50
+max_steps: 3000
+eval_every: 100
+save_every: 250
+log_every: 10
+max_eval_batches: 8
+amp: true
+tokenizer:
+  type: "byte"
+  vocab_size: 260
+cache:
+  enabled: false
+  dir: "data_local/cache"
+  truncate_chars: 20000

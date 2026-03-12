@@ -1,0 +1,8 @@
+checkpoint_path: "outputs/runs/im2svg_curriculum_tiny/checkpoints/latest/model.pt"
+vocab_path: "outputs/runs/im2svg_curriculum_tiny/tokenizer.json"
+output_dir: "outputs/runs/im2svg_curriculum_tiny/infer_check"
+image_path: ""
+max_new_tokens: 128
+temperature: 0.0
+top_p: 0.0
+prompt_svg_prefix: "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'>"

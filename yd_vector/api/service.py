@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import threading
 import uuid
@@ -251,6 +252,7 @@ def run_image_inference(
             if not bundle.config.use_vision:
                 raise ValueError("The selected inference config does not enable image conditioning")
             image_bytes = _decode_image_bytes(image_data_url)
+            image_sha1_short = hashlib.sha1(image_bytes).hexdigest()[:12]
 
             decode_max_new_tokens = int(max_new_tokens or bundle.infer_cfg.get("max_new_tokens", 256))
             decode_temperature = float(temperature if temperature is not None else bundle.infer_cfg.get("temperature", 1.0))
@@ -290,6 +292,7 @@ def run_image_inference(
             output_svg_path = output_dir / f"api_{ts}_{job_id}.svg"
             with open(output_svg_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(svg_text)
+            svg_sha1_short = hashlib.sha1(svg_text.encode("utf-8")).hexdigest()[:12]
 
             duration_ms = round((perf_counter() - started) * 1000.0, 2)
             result = {
@@ -309,6 +312,8 @@ def run_image_inference(
                 "output_svg_path": relative_repo_path(output_svg_path),
                 "output_dir": relative_repo_path(output_dir),
                 "svg_char_length": len(svg_text),
+                "svg_sha1_short": svg_sha1_short,
+                "image_sha1_short": image_sha1_short,
                 "svg_content": svg_text,
                 "svg_url": f"/api/jobs/{job_id}/svg",
                 "prompt": prompt_text,
