@@ -12,9 +12,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the YD-Vector local API server.")
+    parser = argparse.ArgumentParser(description="Run the YD-Vector local API server with hybrid vectorizer routes.")
     parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8008)
+    parser.add_argument("--port", type=int, default=2020)
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
 

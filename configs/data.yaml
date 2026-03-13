@@ -1,6 +1,0 @@
-raw_svg_dir: "E:/Yadhu Projects/SVG"
-normalized_dir: "E:/Yadhu Projects/SVG_NORMALIZED"
-max_file_bytes: 5242880
-min_chars: 20
-float_precision: 4
-truncate_chars: 200000

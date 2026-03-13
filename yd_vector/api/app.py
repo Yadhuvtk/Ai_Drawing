@@ -2,22 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
 
-from yd_vector.api.service import current_device_name, get_job, is_busy, list_inference_configs, resolve_repo_path, run_image_inference
-
-
-class InferRequest(BaseModel):
-    config_path: str
-    image_data_url: str
-    image_name: str | None = None
-    prompt: str | None = None
-    max_new_tokens: int | None = None
-    temperature: float | None = None
-    top_p: float | None = None
+from yd_vector.api.hybrid_service import get_hybrid_job, hybrid_busy, run_hybrid_vectorization
+from yd_vector.paths import OUTPUTS_DIR, ensure_dir, resolve_repo_path
 
 
 app = FastAPI(title="YD-Vector Local API", version="0.1.0")
@@ -28,36 +19,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+ensure_dir(OUTPUTS_DIR)
+app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
 
 
 @app.get("/api/health")
 def health() -> dict[str, object]:
-    configs = list_inference_configs()
     return {
         "status": "ok",
-        "device": current_device_name(),
-        "busy": is_busy(),
-        "config_count": len(configs),
+        "busy": hybrid_busy(),
+        "active_generate_route": "/api/hybrid-vectorize",
+        "pipeline": "hybrid_vectorizer",
     }
 
 
-@app.get("/api/configs")
-def configs() -> dict[str, object]:
-    configs = list_inference_configs()
-    return {"configs": configs}
-
-
-@app.post("/api/infer")
-def infer(request: InferRequest) -> dict[str, object]:
+@app.post("/api/hybrid-vectorize")
+async def hybrid_vectorize(image: UploadFile = File(...)) -> dict[str, object]:
     try:
-        return run_image_inference(
-            config_path=request.config_path,
-            image_data_url=request.image_data_url,
-            image_name=request.image_name,
-            prompt=request.prompt,
-            max_new_tokens=request.max_new_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
+        image_bytes = await image.read()
+        return run_hybrid_vectorization(
+            image_bytes=image_bytes,
+            image_name=image.filename,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -69,7 +51,7 @@ def infer(request: InferRequest) -> dict[str, object]:
 
 @app.get("/api/jobs/{job_id}")
 def job(job_id: str) -> dict[str, object]:
-    result = get_job(job_id)
+    result = get_hybrid_job(job_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
     return result
@@ -77,7 +59,7 @@ def job(job_id: str) -> dict[str, object]:
 
 @app.get("/api/jobs/{job_id}/svg")
 def job_svg(job_id: str):
-    result = get_job(job_id)
+    result = get_hybrid_job(job_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
     if result.get("status") != "completed":

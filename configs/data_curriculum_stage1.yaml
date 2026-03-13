@@ -1,6 +1,0 @@
-raw_svg_dir: "data_local/curriculum_stage1/svg"
-normalized_dir: "data_local/curriculum_stage1/svg"
-max_file_bytes: 1048576
-min_chars: 20
-float_precision: 4
-truncate_chars: 20000
