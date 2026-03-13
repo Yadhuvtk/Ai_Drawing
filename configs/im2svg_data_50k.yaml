@@ -1,0 +1,10 @@
+raw_svg_manifest: "data_local/manifest/manifest.jsonl"
+output_png_dir: "data_local/renders_256_50k"
+output_manifest: "data_local/manifest/im2svg_manifest_256_50k.jsonl"
+failures_report: "data_local/manifest/im2svg_failures_256_50k.jsonl"
+inkscape_exe: "C://Program Files/Inkscape//bin/inkscape.com"
+image_size: 256
+limit: 50000
+num_workers: 8
+overwrite: false
+timeout_seconds: 30
