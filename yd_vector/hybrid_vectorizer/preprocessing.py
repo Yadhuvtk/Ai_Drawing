@@ -26,6 +26,41 @@ class PreprocessResult:
     binary_mask: np.ndarray
     threshold: int
     foreground_threshold: float
+    canvas_origin_x: float = 0.0
+    canvas_origin_y: float = 0.0
+
+    @property
+    def working_width(self) -> int:
+        return self.width
+
+    @property
+    def working_height(self) -> int:
+        return self.height
+
+    @property
+    def original_size(self) -> tuple[int, int]:
+        return self.original_width, self.original_height
+
+    @property
+    def offset_x(self) -> float:
+        return float(self.canvas_origin_x)
+
+    @property
+    def offset_y(self) -> float:
+        return float(self.canvas_origin_y)
+
+    @property
+    def view_box(self) -> tuple[float, float, float, float]:
+        return (
+            0.0,
+            0.0,
+            float(self.original_width),
+            float(self.original_height),
+        )
+
+    @property
+    def source_aspect_ratio(self) -> float:
+        return float(self.original_width) / max(1.0, float(self.original_height))
 
 
 def preprocess_image(image_path: str | Path, config: HybridVectorizerConfig) -> PreprocessResult:
@@ -61,8 +96,8 @@ def preprocess_image(image_path: str | Path, config: HybridVectorizerConfig) -> 
     )
 
     height, width = grayscale.shape
-    scale_x = float(original_width) / max(1.0, float(width))
-    scale_y = float(original_height) / max(1.0, float(height))
+    scale_x = _coordinate_scale(original_width, width)
+    scale_y = _coordinate_scale(original_height, height)
     return PreprocessResult(
         width=width,
         height=height,
@@ -78,6 +113,8 @@ def preprocess_image(image_path: str | Path, config: HybridVectorizerConfig) -> 
         binary_mask=binary_mask.astype(bool),
         threshold=threshold,
         foreground_threshold=float(foreground_threshold),
+        canvas_origin_x=0.0,
+        canvas_origin_y=0.0,
     )
 
 
@@ -129,6 +166,10 @@ def _resize_longest_side(image: Image.Image, target_size: int | None) -> Image.I
     interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
     resized = cv2.resize(rgba, new_size, interpolation=interpolation)
     return Image.fromarray(resized, mode="RGBA")
+
+
+def _coordinate_scale(original_size: int, working_size: int) -> float:
+    return float(original_size) / max(1.0, float(working_size))
 
 
 def _build_foreground_field(grayscale: np.ndarray, alpha: np.ndarray, config: HybridVectorizerConfig) -> np.ndarray:

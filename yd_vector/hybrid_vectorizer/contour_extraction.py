@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import cv2
 import numpy as np
 
@@ -9,7 +11,32 @@ from yd_vector.hybrid_vectorizer.geometry import (
     Point,
     bounding_box_from_points,
     polygon_area,
+    polygon_perimeter,
 )
+
+
+@dataclass
+class RegionLoop(ClosedContour):
+    perimeter: float = 0.0
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def loop_id(self) -> str:
+        return self.contour_id
+
+
+@dataclass
+class RegionShape(ContourRegion):
+    fill_polarity: str = "positive"
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def outer_loop(self) -> RegionLoop:
+        return self.outer  # type: ignore[return-value]
+
+    @property
+    def hole_loops(self) -> list[RegionLoop]:
+        return self.holes  # type: ignore[return-value]
 
 
 def extract_regions(
@@ -19,7 +46,11 @@ def extract_regions(
     scalar_field: np.ndarray | None = None,
     contour_level: float | None = None,
     subpixel: bool = True,
-) -> list[ContourRegion]:
+    coordinate_scale_x: float = 1.0,
+    coordinate_scale_y: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+) -> list[RegionShape]:
     del scalar_field, contour_level
 
     binary_mask = np.asarray(mask, dtype=np.uint8)
@@ -33,7 +64,7 @@ def extract_regions(
 
     hierarchy = hierarchy[0]
     depths = [_hierarchy_depth(index, hierarchy) for index in range(len(contours))]
-    regions: list[ContourRegion] = []
+    regions: list[RegionShape] = []
     region_index = 0
 
     for contour_index, contour in enumerate(contours):
@@ -46,11 +77,15 @@ def extract_regions(
             is_hole=False,
             parent_id=None,
             subpixel=subpixel,
+            coordinate_scale_x=coordinate_scale_x,
+            coordinate_scale_y=coordinate_scale_y,
+            offset_x=offset_x,
+            offset_y=offset_y,
         )
         if outer is None or outer.area < min_region_area:
             continue
 
-        holes: list[ClosedContour] = []
+        holes: list[RegionLoop] = []
         child_index = int(hierarchy[contour_index][2])
         hole_index = 0
         while child_index != -1:
@@ -61,6 +96,10 @@ def extract_regions(
                     is_hole=True,
                     parent_id=outer.contour_id,
                     subpixel=subpixel,
+                    coordinate_scale_x=coordinate_scale_x,
+                    coordinate_scale_y=coordinate_scale_y,
+                    offset_x=offset_x,
+                    offset_y=offset_y,
                 )
                 if hole is not None and hole.area >= min_hole_area:
                     holes.append(hole)
@@ -70,16 +109,52 @@ def extract_regions(
         outer.children_ids = [hole.contour_id for hole in holes]
         holes.sort(key=lambda item: item.area, reverse=True)
         regions.append(
-            ContourRegion(
+            RegionShape(
                 region_id=f"region_{region_index:03d}",
                 outer=outer,
                 holes=holes,
+                fill_polarity="positive",
+                metadata={
+                    "source": "binary_mask",
+                    "subpixel": bool(subpixel),
+                    "coordinate_space": "image",
+                    "coordinate_scale_x": float(coordinate_scale_x),
+                    "coordinate_scale_y": float(coordinate_scale_y),
+                    "offset_x": float(offset_x),
+                    "offset_y": float(offset_y),
+                },
             )
         )
         region_index += 1
 
     regions.sort(key=lambda item: item.outer.area, reverse=True)
     return regions
+
+
+def extract_region_shapes(
+    mask: np.ndarray,
+    min_region_area: int = 32,
+    min_hole_area: int = 16,
+    scalar_field: np.ndarray | None = None,
+    contour_level: float | None = None,
+    subpixel: bool = True,
+    coordinate_scale_x: float = 1.0,
+    coordinate_scale_y: float = 1.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+) -> list[RegionShape]:
+    return extract_regions(
+        mask,
+        min_region_area=min_region_area,
+        min_hole_area=min_hole_area,
+        scalar_field=scalar_field,
+        contour_level=contour_level,
+        subpixel=subpixel,
+        coordinate_scale_x=coordinate_scale_x,
+        coordinate_scale_y=coordinate_scale_y,
+        offset_x=offset_x,
+        offset_y=offset_y,
+    )
 
 
 def _find_contours_with_hierarchy(binary_mask: np.ndarray) -> tuple[list[np.ndarray], np.ndarray | None]:
@@ -106,14 +181,24 @@ def _contour_to_closed_contour(
     is_hole: bool,
     parent_id: str | None,
     subpixel: bool,
-) -> ClosedContour | None:
+    coordinate_scale_x: float,
+    coordinate_scale_y: float,
+    offset_x: float,
+    offset_y: float,
+) -> RegionLoop | None:
     coords = np.asarray(contour, dtype=np.float64).reshape(-1, 2)
     if len(coords) < 3:
         return None
 
     offset = 0.5 if subpixel else 0.0
     points = _dedupe_consecutive_points(
-        [Point(float(x) + offset, float(y) + offset) for x, y in coords]
+        [
+            Point(
+                (float(x) + offset) * float(coordinate_scale_x) + float(offset_x),
+                (float(y) + offset) * float(coordinate_scale_y) + float(offset_y),
+            )
+            for x, y in coords
+        ]
     )
     if len(points) < 3:
         return None
@@ -127,13 +212,22 @@ def _contour_to_closed_contour(
         points = list(reversed(points))
 
     area = abs(polygon_area(points))
-    return ClosedContour(
+    return RegionLoop(
         contour_id=contour_id,
         points=points,
         area=area,
         bbox=bounding_box_from_points(points),
+        perimeter=polygon_perimeter(points),
         is_hole=is_hole,
         parent_id=parent_id,
+        metadata={
+            "offset_x": float(offset_x),
+            "offset_y": float(offset_y),
+            "subpixel_offset": 0.5 if subpixel else 0.0,
+            "coordinate_scale_x": float(coordinate_scale_x),
+            "coordinate_scale_y": float(coordinate_scale_y),
+            "coordinate_space": "image",
+        },
     )
 
 

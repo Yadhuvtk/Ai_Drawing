@@ -19,12 +19,16 @@ from yd_vector.hybrid_vectorizer.geometry import (
 
 
 def export_svg(document: VectorDocument, background: str | None = None) -> str:
+    view_min_x, view_min_y, view_width, view_height = _document_view_box(document)
     lines = [
-        f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {document.width} {document.height}'>"
+        f"<svg xmlns='http://www.w3.org/2000/svg' width='{_fmt_number(view_width)}' height='{_fmt_number(view_height)}' "
+        f"viewBox='{_fmt_number(view_min_x)} {_fmt_number(view_min_y)} {_fmt_number(view_width)} {_fmt_number(view_height)}' "
+        "preserveAspectRatio='xMidYMid meet'>"
     ]
     if background:
         lines.append(
-            f"  <rect x='0' y='0' width='{document.width}' height='{document.height}' fill='{background}'/>"
+            f"  <rect x='{_fmt_number(view_min_x)}' y='{_fmt_number(view_min_y)}' "
+            f"width='{_fmt_number(view_width)}' height='{_fmt_number(view_height)}' fill='{background}'/>"
         )
 
     if document.layers:
@@ -61,6 +65,15 @@ def _shape_to_svg_markups(shape: Shape) -> list[str]:
     outer_markup = _outer_loop_markup(shape)
     hole_markups = [_hole_loop_markup(loop) for loop in shape.negative_loops]
     return [outer_markup, *hole_markups]
+
+
+def _document_view_box(document: VectorDocument) -> tuple[float, float, float, float]:
+    metadata = document.metadata or {}
+    min_x = _metadata_float(metadata, "viewBox_min_x", 0.0)
+    min_y = _metadata_float(metadata, "viewBox_min_y", 0.0)
+    width = _metadata_float(metadata, "viewBox_width", float(document.width))
+    height = _metadata_float(metadata, "viewBox_height", float(document.height))
+    return min_x, min_y, width, height
 
 
 def _shape_to_path_data(shape: Shape) -> str:
@@ -223,6 +236,16 @@ def _fmt_number(value: float) -> str:
     text = f"{rounded:.2f}"
     text = text.rstrip("0").rstrip(".")
     return text or "0"
+
+
+def _metadata_float(metadata: dict[str, str], key: str, default: float) -> float:
+    raw = metadata.get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 def _same_point(left: Point, right: Point) -> bool:

@@ -4,6 +4,7 @@ from dataclasses import replace
 from math import acos, ceil, degrees, exp, radians
 
 from yd_vector.hybrid_vectorizer.config import HybridVectorizerConfig
+from yd_vector.hybrid_vectorizer.contour_extraction import RegionShape
 from yd_vector.hybrid_vectorizer.geometry import (
     ClosedContour,
     ContourRegion,
@@ -16,27 +17,33 @@ from yd_vector.hybrid_vectorizer.shape_analysis import detect_narrow_gap_indices
 from yd_vector.hybrid_vectorizer.topology_guard import validate_contour_points
 
 
+HARD_CORNER_ANGLE_THRESHOLD_DEGREES = 60.0
+
+
 def cleanup_region(region: ContourRegion, config: HybridVectorizerConfig) -> ContourRegion:
     outer = cleanup_contour(region.outer, config)
     holes = [cleanup_contour(hole, config) for hole in region.holes]
     outer.children_ids = [hole.contour_id for hole in holes]
+    if isinstance(region, RegionShape):
+        return RegionShape(
+            region_id=region.region_id,
+            outer=outer,
+            holes=holes,
+            fill_polarity=region.fill_polarity,
+            metadata=region.metadata.copy(),
+        )
     return ContourRegion(region_id=region.region_id, outer=outer, holes=holes)
 
 
 def cleanup_contour(contour: ClosedContour, config: HybridVectorizerConfig) -> ClosedContour:
     original_points = merge_near_duplicate_points(contour.points, max(0.01, config.merge_distance * 0.5))
-    points = gaussian_smooth_closed_contour(original_points, sigma=1.0)
-    points = remove_collinear_points(points, tolerance=max(0.05, config.simplify_tolerance * 0.12))
-    points = douglas_peucker_closed(points, tolerance=min(0.8, max(0.2, config.simplify_tolerance)))
-    if not validate_contour_points(contour, points, config):
-        points = original_points
-
-    anchor_points = points[:]
-    corner_protection_angle = max(config.corner_angle_threshold_degrees, config.min_corner_angle_deg)
-    corner_indices = detect_corner_indices(anchor_points, corner_protection_angle)
+    hard_corner_indices = detect_hard_corner_indices(
+        original_points,
+        angle_threshold_deg=HARD_CORNER_ANGLE_THRESHOLD_DEGREES,
+    )
     gap_indices = (
         detect_narrow_gap_indices(
-            anchor_points,
+            original_points,
             gap_distance=config.gap_preservation_distance,
             protect_span=config.gap_protection_span,
             min_index_separation=3,
@@ -44,26 +51,43 @@ def cleanup_contour(contour: ClosedContour, config: HybridVectorizerConfig) -> C
         if config.preserve_narrow_gaps
         else set()
     )
-    smoothed = smooth_closed_contour(
+    structural_indices = detect_structural_anchor_indices(contour, original_points)
+    protected_indices = hard_corner_indices | gap_indices | structural_indices
+
+    working_points = presmooth_contour_points(
+        contour,
+        original_points,
+        protected_indices=protected_indices,
+    )
+
+    anchor_points = remove_collinear_points(
+        working_points,
+        tolerance=max(0.05, config.simplify_tolerance * 0.12),
+        protected_indices=protected_indices,
+    )
+    if not validate_contour_points(contour, anchor_points, config):
+        anchor_points = working_points
+
+    smoothed = smooth_between_corners(
         anchor_points,
-        corner_indices=corner_indices | gap_indices,
-        iterations=config.smooth_iterations,
-        strength=config.smooth_strength,
+        corner_indices=protected_indices,
+        passes=config.smooth_iterations,
+        strength=cleanup_smoothing_strength(contour, config),
     )
     smoothed = collapse_short_edges(
         smoothed,
         min_length=max(0.4, config.merge_distance * 0.9),
-        protected_indices=corner_indices | gap_indices,
+        protected_indices=protected_indices,
     )
     smoothed = simplify_closed_preserving_indices(
         smoothed,
-        tolerance=max(0.2, config.simplify_tolerance * 0.45),
-        protected_indices=corner_indices | gap_indices,
+        tolerance=cleanup_simplify_tolerance(contour, config),
+        protected_indices=protected_indices,
     )
     smoothed = remove_collinear_points(
         smoothed,
         tolerance=max(0.06, config.simplify_tolerance * 0.18),
-        protected_indices=corner_indices | gap_indices,
+        protected_indices=protected_indices,
     )
     if len(smoothed) < 3 or not validate_contour_points(contour, smoothed, config):
         points = anchor_points if validate_contour_points(contour, anchor_points, config) else original_points
@@ -175,6 +199,46 @@ def gaussian_smooth_closed_contour(points: list[Point], sigma: float) -> list[Po
     return smoothed
 
 
+def detect_structural_anchor_indices(contour: ClosedContour, points: list[Point]) -> set[int]:
+    anchors = _extrema_anchor_indices(points)
+    if _is_shadow_like_contour(contour):
+        anchors |= _shadow_bridge_anchor_indices(points, contour)
+    return anchors
+
+
+def presmooth_contour_points(
+    contour: ClosedContour,
+    points: list[Point],
+    protected_indices: set[int],
+) -> list[Point]:
+    if len(points) < 8:
+        return points
+
+    if _is_shadow_like_contour(contour):
+        return _blend_gaussian_smoothed_points(
+            points,
+            sigma=1.15,
+            blend=0.4,
+            protected_indices=protected_indices,
+        )
+
+    return points
+
+
+def cleanup_simplify_tolerance(contour: ClosedContour, config: HybridVectorizerConfig) -> float:
+    base_tolerance = min(0.8, max(0.2, config.simplify_tolerance))
+    if _is_shadow_like_contour(contour):
+        return min(0.85, max(0.45, base_tolerance * 0.95))
+    return base_tolerance
+
+
+def cleanup_smoothing_strength(contour: ClosedContour, config: HybridVectorizerConfig) -> float:
+    base_strength = max(0.0, min(0.85, config.smooth_strength))
+    if _is_shadow_like_contour(contour):
+        return min(base_strength, 0.26)
+    return base_strength
+
+
 def detect_corner_indices(points: list[Point], corner_angle_threshold_degrees: float) -> set[int]:
     if len(points) < 3:
         return set()
@@ -187,6 +251,45 @@ def detect_corner_indices(points: list[Point], corner_angle_threshold_degrees: f
         if angle <= corner_angle_threshold_degrees:
             corners.add(index)
     return corners
+
+
+def detect_hard_corner_indices(points: list[Point], angle_threshold_deg: float = HARD_CORNER_ANGLE_THRESHOLD_DEGREES) -> set[int]:
+    if len(points) < 3:
+        return set()
+
+    corners = set()
+    for index, point in enumerate(points):
+        prev_point = points[index - 1]
+        next_point = points[(index + 1) % len(points)]
+        interior_angle = _corner_angle_degrees(prev_point, point, next_point)
+        turn_angle = max(0.0, 180.0 - interior_angle)
+        if turn_angle >= angle_threshold_deg:
+            corners.add(index)
+    return corners
+
+
+def smooth_between_corners(
+    points: list[Point],
+    corner_indices: set[int],
+    passes: int = 1,
+    strength: float = 0.35,
+) -> list[Point]:
+    if len(points) < 5 or passes <= 0 or strength <= 0.0:
+        return points
+
+    protected = {index % len(points) for index in corner_indices}
+    if not protected:
+        return smooth_closed_contour(points, corner_indices=set(), iterations=passes, strength=strength)
+
+    if _curvature_variance(points) < 0.3:
+        passes = max(passes, 3)
+
+    current = points[:]
+    strength = max(0.0, min(0.85, strength))
+    for _ in range(passes):
+        current = _smooth_runs_between_corners(current, protected, strength)
+        current = _smooth_runs_between_corners(current, protected, -0.45 * strength)
+    return current
 
 
 def smooth_closed_contour(
@@ -271,6 +374,172 @@ def collapse_short_edges(
     return current
 
 
+def _blend_gaussian_smoothed_points(
+    points: list[Point],
+    sigma: float,
+    blend: float,
+    protected_indices: set[int],
+) -> list[Point]:
+    smoothed = gaussian_smooth_closed_contour(points, sigma=sigma)
+    protected = {index % len(points) for index in protected_indices}
+    blend = max(0.0, min(1.0, blend))
+
+    blended: list[Point] = []
+    for index, point in enumerate(points):
+        if index in protected:
+            blended.append(point)
+            continue
+        target = smoothed[index]
+        blended.append(
+            Point(
+                x=(1.0 - blend) * point.x + blend * target.x,
+                y=(1.0 - blend) * point.y + blend * target.y,
+            )
+        )
+    return blended
+
+
+def _stabilize_shadow_lower_mass(
+    points: list[Point],
+    contour: ClosedContour,
+    protected_indices: set[int],
+) -> list[Point]:
+    if len(points) < 8:
+        return points
+
+    bbox = contour.bbox
+    split_y = bbox.min_y + bbox.height * 0.34
+    smoothed = gaussian_smooth_closed_contour(points, sigma=1.3)
+    protected = {index % len(points) for index in protected_indices}
+    stabilized: list[Point] = []
+
+    for index, point in enumerate(points):
+        if index in protected or point.y <= split_y:
+            stabilized.append(point)
+            continue
+        target = smoothed[index]
+        stabilized.append(
+            Point(
+                x=point.x + 0.62 * (target.x - point.x),
+                y=point.y + 0.62 * (target.y - point.y),
+            )
+        )
+    return stabilized
+
+
+def _extrema_anchor_indices(points: list[Point]) -> set[int]:
+    if not points:
+        return set()
+
+    center_x = sum(point.x for point in points) / len(points)
+    center_y = sum(point.y for point in points) / len(points)
+    top_index = min(range(len(points)), key=lambda idx: (points[idx].y, abs(points[idx].x - center_x)))
+    bottom_index = max(range(len(points)), key=lambda idx: (points[idx].y, -abs(points[idx].x - center_x)))
+    left_index = min(range(len(points)), key=lambda idx: (points[idx].x, abs(points[idx].y - center_y)))
+    right_index = max(range(len(points)), key=lambda idx: (points[idx].x, -abs(points[idx].y - center_y)))
+    return {top_index, bottom_index, left_index, right_index}
+
+
+def _pin_body_anchor_indices(points: list[Point], contour: ClosedContour) -> set[int]:
+    bbox = contour.bbox
+    if bbox.width <= 0.0 or bbox.height <= 0.0:
+        return set()
+
+    center_x = bbox.min_x + bbox.width * 0.5
+    target_y = bbox.min_y + bbox.height * 0.6
+    left_candidates = [index for index, point in enumerate(points) if point.x <= center_x]
+    right_candidates = [index for index, point in enumerate(points) if point.x >= center_x]
+    anchors: set[int] = set()
+    if left_candidates:
+        anchors.add(
+            min(
+                left_candidates,
+                key=lambda idx: (
+                    abs(points[idx].y - target_y) * 1.6,
+                    abs(points[idx].x - (bbox.min_x + bbox.width * 0.23)),
+                ),
+            )
+        )
+    if right_candidates:
+        anchors.add(
+            min(
+                right_candidates,
+                key=lambda idx: (
+                    abs(points[idx].y - target_y) * 1.6,
+                    abs(points[idx].x - (bbox.max_x - bbox.width * 0.23)),
+                ),
+            )
+        )
+    return anchors
+
+
+def _shadow_bridge_anchor_indices(points: list[Point], contour: ClosedContour) -> set[int]:
+    bbox = contour.bbox
+    if bbox.width <= 0.0 or bbox.height <= 0.0:
+        return set()
+
+    center_x = bbox.min_x + bbox.width * 0.5
+    top_rim_limit = bbox.min_y + bbox.height * 0.18
+    notch_depth_limit = bbox.min_y + bbox.height * 0.75
+
+    left_bridge_candidates = [
+        index
+        for index, point in enumerate(points)
+        if point.x < center_x and point.y <= top_rim_limit
+    ]
+    right_bridge_candidates = [
+        index
+        for index, point in enumerate(points)
+        if point.x > center_x and point.y <= top_rim_limit
+    ]
+    notch_candidates = [
+        index
+        for index, point in enumerate(points)
+        if abs(point.x - center_x) <= bbox.width * 0.18 and point.y <= notch_depth_limit
+    ]
+
+    anchors: set[int] = set()
+    if left_bridge_candidates:
+        anchors.add(max(left_bridge_candidates, key=lambda idx: points[idx].x))
+    if right_bridge_candidates:
+        anchors.add(min(right_bridge_candidates, key=lambda idx: points[idx].x))
+    if notch_candidates:
+        anchors.add(
+            max(
+                notch_candidates,
+                key=lambda idx: (points[idx].y, -abs(points[idx].x - center_x)),
+            )
+        )
+    anchors.add(max(range(len(points)), key=lambda idx: points[idx].y))
+    return anchors
+
+
+def _is_pin_body_like_contour(contour: ClosedContour) -> bool:
+    if contour.is_hole:
+        return False
+
+    bbox = contour.bbox
+    if bbox.width <= 0.0 or bbox.height <= 0.0:
+        return False
+
+    aspect_ratio = bbox.height / bbox.width
+    fill_ratio = contour.area / max(1e-6, bbox.width * bbox.height)
+    return aspect_ratio >= 1.18 and 0.46 <= fill_ratio <= 0.9
+
+
+def _is_shadow_like_contour(contour: ClosedContour) -> bool:
+    if contour.is_hole:
+        return False
+
+    bbox = contour.bbox
+    if bbox.width <= 0.0 or bbox.height <= 0.0:
+        return False
+
+    aspect_ratio = bbox.width / bbox.height
+    fill_ratio = contour.area / max(1e-6, bbox.width * bbox.height)
+    return aspect_ratio >= 1.65 and 0.38 <= fill_ratio <= 0.92
+
+
 def _smooth_closed_pass(points: list[Point], protected_indices: set[int], strength: float) -> list[Point]:
     updated = points[:]
     count = len(points)
@@ -293,6 +562,69 @@ def _smooth_closed_pass(points: list[Point], protected_indices: set[int], streng
         updated[index] = Point(
             x=point.x + local_strength * (target.x - point.x),
             y=point.y + local_strength * (target.y - point.y),
+        )
+    return updated
+
+
+def _smooth_runs_between_corners(points: list[Point], protected_indices: set[int], strength: float) -> list[Point]:
+    if len(points) < 5 or not protected_indices:
+        return points
+
+    updated = points[:]
+    for span_indices in _iter_closed_spans_between_corners(len(points), protected_indices):
+        if len(span_indices) < 3:
+            continue
+        span_points = [points[index] for index in span_indices]
+        smoothed_span = _smooth_open_span_points(span_points, strength)
+        for local_index, global_index in enumerate(span_indices[1:-1], start=1):
+            updated[global_index] = smoothed_span[local_index]
+    return updated
+
+
+def _iter_closed_spans_between_corners(count: int, protected_indices: set[int]) -> list[list[int]]:
+    if count <= 0 or not protected_indices:
+        return [list(range(count))]
+
+    ordered = sorted(index % count for index in protected_indices)
+    if len(ordered) == 1:
+        start_index = ordered[0]
+        return [[(start_index + offset) % count for offset in range(count + 1)]]
+
+    spans: list[list[int]] = []
+    for offset, start_index in enumerate(ordered):
+        end_index = ordered[(offset + 1) % len(ordered)]
+        indices = [start_index]
+        cursor = start_index
+        while cursor != end_index:
+            cursor = (cursor + 1) % count
+            indices.append(cursor)
+            if len(indices) > count + 1:
+                break
+        spans.append(indices)
+    return spans
+
+
+def _smooth_open_span_points(points: list[Point], strength: float) -> list[Point]:
+    if len(points) < 3:
+        return points
+
+    updated = points[:]
+    last_index = len(points) - 1
+    for index in range(1, last_index):
+        point = points[index]
+        prev2 = points[max(0, index - 2)]
+        prev1 = points[index - 1]
+        next1 = points[index + 1]
+        next2 = points[min(last_index, index + 2)]
+        target = Point(
+            x=(prev2.x + 4.0 * prev1.x + 6.0 * point.x + 4.0 * next1.x + next2.x) / 16.0,
+            y=(prev2.y + 4.0 * prev1.y + 6.0 * point.y + 4.0 * next1.y + next2.y) / 16.0,
+        )
+        angle = _corner_angle_degrees(prev1, point, next1)
+        curve_factor = _smooth_curve_factor(angle)
+        updated[index] = Point(
+            x=point.x + strength * curve_factor * (target.x - point.x),
+            y=point.y + strength * curve_factor * (target.y - point.y),
         )
     return updated
 
