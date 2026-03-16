@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import atan2, cos, degrees, pi, radians, sin, sqrt
 
+import cv2
 import numpy as np
 
 from yd_vector.hybrid_vectorizer.geometry import (
@@ -23,6 +24,7 @@ from yd_vector.hybrid_vectorizer.geometry import (
 class CircleFitResult:
     primitive: PrimitiveCircle
     radial_error: float
+    max_radial_error: float
     circularity: float
     area_ratio: float
     confidence: float
@@ -32,6 +34,7 @@ class CircleFitResult:
 class EllipseFitResult:
     primitive: PrimitiveEllipse
     normalized_error: float
+    max_normalized_error: float
     area_ratio: float
     confidence: float
 
@@ -87,13 +90,18 @@ def fit_circle(points: list[Point]) -> CircleFitResult | None:
     if len(points) < 8:
         return None
 
-    fit = _fit_circle_parameters(points)
-    if fit is None:
+    coords = np.asarray([(point.x, point.y) for point in points], dtype=np.float32).reshape((-1, 1, 2))
+    (cx, cy), radius = cv2.minEnclosingCircle(coords)
+    if radius <= 0.0:
         return None
 
-    center, radius, radii = fit
-    coords = np.asarray([(point.x, point.y) for point in points], dtype=np.float64)
+    center = Point(float(cx), float(cy))
+    radii = np.sqrt(
+        (coords[:, 0, 0].astype(np.float64) - center.x) ** 2
+        + (coords[:, 0, 1].astype(np.float64) - center.y) ** 2
+    )
     radial_error = float(np.std(radii) / max(1e-6, radius))
+    max_radial_error = float(np.max(np.abs(radii - radius)) / max(1e-6, radius))
 
     area = abs(polygon_area(points))
     perimeter = polygon_perimeter(points)
@@ -102,13 +110,17 @@ def fit_circle(points: list[Point]) -> CircleFitResult | None:
     area_ratio = float(area / max(1e-6, expected_area))
 
     confidence = _combine_confidence(
-        _scaled_score(radial_error, 0.0, 0.14, invert=True),
-        _scaled_score(circularity, 0.65, 0.98, invert=False),
-        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.28, invert=True),
+        _scaled_score(radial_error, 0.0, 0.09, invert=True),
+        _scaled_score(max_radial_error, 0.0, 0.14, invert=True),
+        _scaled_score(circularity, 0.78, 0.995, invert=False),
+        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.14, invert=True),
     )
+    if circularity > 0.88:
+        confidence = max(confidence, 0.96)
     return CircleFitResult(
         primitive=PrimitiveCircle(center=center, radius=radius),
         radial_error=radial_error,
+        max_radial_error=max_radial_error,
         circularity=circularity,
         area_ratio=area_ratio,
         confidence=confidence,
@@ -179,14 +191,16 @@ def fit_rotated_ellipse(points: list[Point]) -> EllipseFitResult | None:
 
     normalized = (rotated[:, 0] / radius_x) ** 2 + (rotated[:, 1] / radius_y) ** 2
     normalized_error = float(np.mean(np.abs(normalized - 1.0)))
+    max_normalized_error = float(np.max(np.abs(normalized - 1.0)))
 
     area = abs(polygon_area(points))
     expected_area = pi * radius_x * radius_y
     area_ratio = float(area / max(1e-6, expected_area))
 
     confidence = _combine_confidence(
-        _scaled_score(normalized_error, 0.0, 0.24, invert=True),
-        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.36, invert=True),
+        _scaled_score(normalized_error, 0.0, 0.14, invert=True),
+        _scaled_score(max_normalized_error, 0.0, 0.22, invert=True),
+        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.18, invert=True),
     )
 
     primitive = PrimitiveEllipse(
@@ -198,6 +212,7 @@ def fit_rotated_ellipse(points: list[Point]) -> EllipseFitResult | None:
     return EllipseFitResult(
         primitive=primitive,
         normalized_error=normalized_error,
+        max_normalized_error=max_normalized_error,
         area_ratio=area_ratio,
         confidence=confidence,
     )
@@ -287,9 +302,9 @@ def fit_rectangle(points: list[Point]) -> RectangleFitResult | None:
     area_ratio = float(area / max(1e-6, expected_area))
     norm_scale = max(1.0, min(frame.half_width, frame.half_height))
     confidence = _combine_confidence(
-        _scaled_score(mean_error / norm_scale, 0.0, 0.09, invert=True),
-        _scaled_score(max_error / norm_scale, 0.0, 0.18, invert=True),
-        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.25, invert=True),
+        _scaled_score(mean_error / norm_scale, 0.0, 0.06, invert=True),
+        _scaled_score(max_error / norm_scale, 0.0, 0.12, invert=True),
+        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.14, invert=True),
     )
     return RectangleFitResult(
         primitive=primitive,
@@ -346,10 +361,10 @@ def fit_rounded_rectangle(points: list[Point]) -> RoundedRectangleFitResult | No
     norm_scale = max(1.0, min(frame.half_width, frame.half_height))
     radius_ratio = best_radius / max(1e-6, min(frame.half_width, frame.half_height))
     confidence = _combine_confidence(
-        _scaled_score(best_mean_error / norm_scale, 0.0, 0.10, invert=True),
-        _scaled_score(best_max_error / norm_scale, 0.0, 0.20, invert=True),
-        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.30, invert=True),
-        _scaled_score(radius_ratio, 0.10, 0.42, invert=False),
+        _scaled_score(best_mean_error / norm_scale, 0.0, 0.07, invert=True),
+        _scaled_score(best_max_error / norm_scale, 0.0, 0.14, invert=True),
+        _scaled_score(abs(1.0 - area_ratio), 0.0, 0.18, invert=True),
+        _scaled_score(radius_ratio, 0.12, 0.38, invert=False),
     )
     return RoundedRectangleFitResult(
         primitive=primitive,

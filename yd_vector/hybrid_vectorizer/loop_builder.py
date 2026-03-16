@@ -12,6 +12,7 @@ from yd_vector.hybrid_vectorizer.geometry import (
     PrimitiveRoundedRectangle,
     SegmentArcCircular,
     SegmentArcElliptical,
+    SegmentBezierCubic,
     SegmentLine,
 )
 
@@ -70,6 +71,59 @@ def build_circle_loop(
         closed=True,
         source_contour_id=source_contour_id,
         primitive=circle,
+        confidence=confidence,
+    )
+
+
+def build_circle_cubic_loop(
+    loop_id: str,
+    circle: PrimitiveCircle,
+    polarity: str = "positive",
+    source_contour_id: str | None = None,
+    confidence: float = 1.0,
+) -> Loop:
+    cx = circle.center.x
+    cy = circle.center.y
+    r = circle.radius
+    k = r * 0.5523
+    start = Point(cx + r, cy)
+    quarter_1_end = Point(cx, cy + r)
+    quarter_2_end = Point(cx - r, cy)
+    quarter_3_end = Point(cx, cy - r)
+    quarter_4_end = start
+
+    segments = [
+        SegmentBezierCubic(
+            start=start,
+            control1=Point(cx + r, cy + k),
+            control2=Point(cx + k, cy + r),
+            end=quarter_1_end,
+        ),
+        SegmentBezierCubic(
+            start=quarter_1_end,
+            control1=Point(cx - k, cy + r),
+            control2=Point(cx - r, cy + k),
+            end=quarter_2_end,
+        ),
+        SegmentBezierCubic(
+            start=quarter_2_end,
+            control1=Point(cx - r, cy - k),
+            control2=Point(cx - k, cy - r),
+            end=quarter_3_end,
+        ),
+        SegmentBezierCubic(
+            start=quarter_3_end,
+            control1=Point(cx + k, cy - r),
+            control2=Point(cx + r, cy - k),
+            end=quarter_4_end,
+        ),
+    ]
+    return Loop(
+        loop_id=loop_id,
+        segments=segments,
+        polarity=polarity,
+        closed=True,
+        source_contour_id=source_contour_id,
         confidence=confidence,
     )
 

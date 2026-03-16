@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from math import acos, degrees
+from math import acos, ceil, degrees, exp, radians
 
 from yd_vector.hybrid_vectorizer.config import HybridVectorizerConfig
 from yd_vector.hybrid_vectorizer.geometry import (
@@ -25,8 +25,9 @@ def cleanup_region(region: ContourRegion, config: HybridVectorizerConfig) -> Con
 
 def cleanup_contour(contour: ClosedContour, config: HybridVectorizerConfig) -> ClosedContour:
     original_points = merge_near_duplicate_points(contour.points, max(0.01, config.merge_distance * 0.5))
-    points = remove_collinear_points(original_points, tolerance=max(0.08, config.simplify_tolerance * 0.2))
-    points = douglas_peucker_closed(points, tolerance=config.simplify_tolerance)
+    points = gaussian_smooth_closed_contour(original_points, sigma=1.0)
+    points = remove_collinear_points(points, tolerance=max(0.05, config.simplify_tolerance * 0.12))
+    points = douglas_peucker_closed(points, tolerance=min(0.8, max(0.2, config.simplify_tolerance)))
     if not validate_contour_points(contour, points, config):
         points = original_points
 
@@ -51,13 +52,17 @@ def cleanup_contour(contour: ClosedContour, config: HybridVectorizerConfig) -> C
     )
     smoothed = collapse_short_edges(
         smoothed,
-        min_length=max(0.35, config.merge_distance * 0.75),
+        min_length=max(0.4, config.merge_distance * 0.9),
         protected_indices=corner_indices | gap_indices,
     )
-    smoothed = douglas_peucker_closed(smoothed, tolerance=max(0.15, config.simplify_tolerance * 0.35))
+    smoothed = simplify_closed_preserving_indices(
+        smoothed,
+        tolerance=max(0.2, config.simplify_tolerance * 0.45),
+        protected_indices=corner_indices | gap_indices,
+    )
     smoothed = remove_collinear_points(
         smoothed,
-        tolerance=max(0.05, config.simplify_tolerance * 0.15),
+        tolerance=max(0.06, config.simplify_tolerance * 0.18),
         protected_indices=corner_indices | gap_indices,
     )
     if len(smoothed) < 3 or not validate_contour_points(contour, smoothed, config):
@@ -73,7 +78,7 @@ def cleanup_contour(contour: ClosedContour, config: HybridVectorizerConfig) -> C
     )
 
 
-def merge_near_duplicate_points(points: list[Point], merge_distance: float) -> list[Point]:
+def merge_near_duplicate_points(points: list[Point], merge_distance: float, closed: bool = True) -> list[Point]:
     if len(points) < 2:
         return points
 
@@ -82,7 +87,7 @@ def merge_near_duplicate_points(points: list[Point], merge_distance: float) -> l
         if distance(merged[-1], point) >= merge_distance:
             merged.append(point)
 
-    if len(merged) > 2 and distance(merged[0], merged[-1]) < merge_distance:
+    if closed and len(merged) > 2 and distance(merged[0], merged[-1]) < merge_distance:
         merged.pop()
     return merged
 
@@ -117,6 +122,59 @@ def douglas_peucker_closed(points: list[Point], tolerance: float) -> list[Point]
     return merge_near_duplicate_points(combined, merge_distance=max(0.01, tolerance * 0.1))
 
 
+def douglas_peucker_open(points: list[Point], tolerance: float) -> list[Point]:
+    if len(points) <= 2 or tolerance <= 0.0:
+        return points
+    return _douglas_peucker_open(points, tolerance)
+
+
+def simplify_closed_preserving_indices(
+    points: list[Point],
+    tolerance: float,
+    protected_indices: set[int] | None = None,
+) -> list[Point]:
+    if len(points) <= 3 or tolerance <= 0.0:
+        return points
+
+    protected = {index % len(points) for index in (protected_indices or set())}
+    if not protected:
+        return douglas_peucker_closed(points, tolerance)
+
+    if len(protected) == 1:
+        protected.add((next(iter(protected)) + len(points) // 2) % len(points))
+
+    ordered = sorted(protected)
+    simplified: list[Point] = []
+    for offset, start_index in enumerate(ordered):
+        end_index = ordered[(offset + 1) % len(ordered)]
+        span = _slice_closed(points, start_index, end_index)
+        reduced_span = _douglas_peucker_open(span, tolerance)
+        if not simplified:
+            simplified.extend(reduced_span)
+        else:
+            simplified.extend(reduced_span[1:])
+    return merge_near_duplicate_points(simplified, merge_distance=max(0.01, tolerance * 0.1))
+
+
+def gaussian_smooth_closed_contour(points: list[Point], sigma: float) -> list[Point]:
+    if len(points) < 5 or sigma <= 0.0:
+        return points
+
+    radius = max(1, int(ceil(3.0 * sigma)))
+    kernel = _gaussian_kernel(radius, sigma)
+    smoothed: list[Point] = []
+    count = len(points)
+    for index in range(count):
+        accum_x = 0.0
+        accum_y = 0.0
+        for offset, weight in zip(range(-radius, radius + 1), kernel):
+            sample = points[(index + offset) % count]
+            accum_x += sample.x * weight
+            accum_y += sample.y * weight
+        smoothed.append(Point(accum_x, accum_y))
+    return smoothed
+
+
 def detect_corner_indices(points: list[Point], corner_angle_threshold_degrees: float) -> set[int]:
     if len(points) < 3:
         return set()
@@ -137,26 +195,18 @@ def smooth_closed_contour(
     iterations: int,
     strength: float,
 ) -> list[Point]:
-    if len(points) < 4 or iterations <= 0 or strength <= 0.0:
+    if len(points) < 5 or iterations <= 0 or strength <= 0.0:
         return points
 
-    strength = max(0.0, min(1.0, strength))
-    current = points[:]
-    for _ in range(iterations):
-        updated = current[:]
-        for index, point in enumerate(current):
-            if index in corner_indices:
-                continue
+    if _curvature_variance(points) < 0.3:
+        iterations = max(iterations, 3)
 
-            prev_point = current[index - 1]
-            next_point = current[(index + 1) % len(current)]
-            avg_x = 0.5 * (prev_point.x + next_point.x)
-            avg_y = 0.5 * (prev_point.y + next_point.y)
-            updated[index] = Point(
-                x=(1.0 - strength) * point.x + strength * avg_x,
-                y=(1.0 - strength) * point.y + strength * avg_y,
-            )
-        current = updated
+    strength = max(0.0, min(0.85, strength))
+    current = points[:]
+    protected_indices = _expand_protected_indices(corner_indices, len(points), radius=1)
+    for _ in range(iterations):
+        current = _smooth_closed_pass(current, protected_indices, strength)
+        current = _smooth_closed_pass(current, protected_indices, -0.45 * strength)
     return current
 
 
@@ -219,6 +269,68 @@ def collapse_short_edges(
             changed = True
             break
     return current
+
+
+def _smooth_closed_pass(points: list[Point], protected_indices: set[int], strength: float) -> list[Point]:
+    updated = points[:]
+    count = len(points)
+    for index, point in enumerate(points):
+        if index in protected_indices:
+            continue
+
+        prev2 = points[(index - 2) % count]
+        prev1 = points[index - 1]
+        next1 = points[(index + 1) % count]
+        next2 = points[(index + 2) % count]
+        target = Point(
+            x=(prev2.x + 4.0 * prev1.x + 6.0 * point.x + 4.0 * next1.x + next2.x) / 16.0,
+            y=(prev2.y + 4.0 * prev1.y + 6.0 * point.y + 4.0 * next1.y + next2.y) / 16.0,
+        )
+        angle = _corner_angle_degrees(prev1, point, next1)
+        curve_factor = _smooth_curve_factor(angle)
+        neighbor_factor = 0.65 if ((index - 1) % count in protected_indices or (index + 1) % count in protected_indices) else 1.0
+        local_strength = strength * curve_factor * neighbor_factor
+        updated[index] = Point(
+            x=point.x + local_strength * (target.x - point.x),
+            y=point.y + local_strength * (target.y - point.y),
+        )
+    return updated
+
+
+def _expand_protected_indices(indices: set[int], count: int, radius: int) -> set[int]:
+    if not indices or count <= 0 or radius <= 0:
+        return set(indices)
+    expanded = set(indices)
+    for index in indices:
+        for offset in range(-radius, radius + 1):
+            expanded.add((index + offset) % count)
+    return expanded
+
+
+def _smooth_curve_factor(angle_degrees: float) -> float:
+    normalized = max(0.0, min(1.0, (angle_degrees - 105.0) / 65.0))
+    return 0.2 + 0.8 * normalized
+
+
+def _gaussian_kernel(radius: int, sigma: float) -> list[float]:
+    weights = [exp(-((offset * offset) / max(1e-6, 2.0 * sigma * sigma))) for offset in range(-radius, radius + 1)]
+    total = sum(weights)
+    return [weight / total for weight in weights]
+
+
+def _curvature_variance(points: list[Point]) -> float:
+    if len(points) < 5:
+        return float("inf")
+
+    curvatures: list[float] = []
+    for index, point in enumerate(points):
+        prev_point = points[index - 1]
+        next_point = points[(index + 1) % len(points)]
+        angle = _corner_angle_degrees(prev_point, point, next_point)
+        curvatures.append(max(0.0, radians(180.0 - angle)))
+
+    mean = sum(curvatures) / len(curvatures)
+    return sum((curvature - mean) ** 2 for curvature in curvatures) / len(curvatures)
 
 
 def _slice_closed(points: list[Point], start_index: int, end_index: int) -> list[Point]:

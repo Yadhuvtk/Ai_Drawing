@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from math import acos, degrees
+
 import numpy as np
 
-from yd_vector.hybrid_vectorizer.cleanup import douglas_peucker_closed, merge_near_duplicate_points
+from yd_vector.hybrid_vectorizer.cleanup import (
+    douglas_peucker_closed,
+    douglas_peucker_open,
+    merge_near_duplicate_points,
+    simplify_closed_preserving_indices,
+)
 from yd_vector.hybrid_vectorizer.config import HybridVectorizerConfig
 from yd_vector.hybrid_vectorizer.corner_modeling import CornerCandidate, classify_contour_corners
 from yd_vector.hybrid_vectorizer.cutout_assembly import assemble_shape
+from yd_vector.hybrid_vectorizer.fit_curves import fit_curve
 from yd_vector.hybrid_vectorizer.geometry import (
     ClosedContour,
     ContourRegion,
@@ -20,7 +29,7 @@ from yd_vector.hybrid_vectorizer.geometry import (
     Shape,
 )
 from yd_vector.hybrid_vectorizer.loop_builder import (
-    build_circle_loop,
+    build_circle_cubic_loop,
     build_ellipse_loop,
     build_polyline_loop,
     build_rectangle_loop,
@@ -41,6 +50,12 @@ from yd_vector.hybrid_vectorizer.shape_analysis import (
     fit_rounded_rectangle,
 )
 from yd_vector.hybrid_vectorizer.topology_guard import validate_loop_against_contour, validate_shape_topology
+
+
+FITCURVES_MIN_ERROR = 2.0
+FITCURVES_PRE_RDP_EPSILON = 0.8
+FITCURVES_MIN_SEGMENT_LENGTH = 3.0
+HARD_CORNER_MIN_TURN_DEGREES = 60.0
 
 
 def fit_region(
@@ -83,7 +98,7 @@ def fit_contour(contour: ClosedContour, config: HybridVectorizerConfig, polarity
     if parameterized is not None and validate_loop_against_contour(parameterized, contour, config):
         return parameterized
 
-    segments = _fit_curve_segments(contour.points, config)
+    segments = fit_freeform_segments(contour.points, config, contour=contour)
     candidate = Loop(
         loop_id=contour.contour_id,
         segments=segments,
@@ -106,24 +121,19 @@ def _fit_parameterized_loop(contour: ClosedContour, config: HybridVectorizerConf
 
     circle_result = fit_circle(contour.points)
     if _is_circle_candidate(circle_result, contour, config):
-        candidates.append(
-            (
-                circle_result.confidence + 0.04,
-                build_circle_loop(
-                    loop_id=contour.contour_id,
-                    circle=circle_result.primitive,
-                    polarity=polarity,
-                    source_contour_id=contour.contour_id,
-                    confidence=circle_result.confidence,
-                ),
-            )
+        return build_circle_cubic_loop(
+            loop_id=contour.contour_id,
+            circle=circle_result.primitive,
+            polarity=polarity,
+            source_contour_id=contour.contour_id,
+            confidence=circle_result.confidence,
         )
 
     ellipse_result = fit_rotated_ellipse(contour.points)
     if _is_ellipse_candidate(ellipse_result, config):
         candidates.append(
             (
-                ellipse_result.confidence + 0.02,
+                ellipse_result.confidence + 0.01,
                 build_ellipse_loop(
                     loop_id=contour.contour_id,
                     ellipse=ellipse_result.primitive,
@@ -138,7 +148,7 @@ def _fit_parameterized_loop(contour: ClosedContour, config: HybridVectorizerConf
     if _is_rounded_rectangle_candidate(rounded_rect_result, config):
         candidates.append(
             (
-                rounded_rect_result.confidence + 0.01,
+                rounded_rect_result.confidence,
                 build_rounded_rectangle_loop(
                     loop_id=contour.contour_id,
                     rounded_rectangle=rounded_rect_result.primitive,
@@ -179,11 +189,18 @@ def _is_circle_candidate(
 
     bbox = contour.bbox
     aspect_ratio = bbox.width / max(1e-6, bbox.height)
+    if result.circularity > 0.88:
+        return (
+            0.82 <= aspect_ratio <= 1.18
+            and result.max_radial_error <= max(0.08, config.circle_fit_tolerance * 1.8)
+            and 0.72 <= result.area_ratio <= 1.08
+        )
     return (
-        0.85 <= aspect_ratio <= 1.15
+        0.9 <= aspect_ratio <= 1.1
         and result.radial_error <= config.circle_fit_tolerance
+        and result.max_radial_error <= config.circle_fit_tolerance * 1.45
         and result.circularity >= config.circle_circularity_min
-        and 0.75 <= result.area_ratio <= 1.25
+        and 0.88 <= result.area_ratio <= 1.12
         and result.confidence >= config.circle_confidence_threshold
     )
 
@@ -193,7 +210,8 @@ def _is_ellipse_candidate(result: EllipseFitResult | None, config: HybridVectori
         return False
     return (
         result.normalized_error <= config.ellipse_fit_tolerance
-        and 0.65 <= result.area_ratio <= 1.35
+        and result.max_normalized_error <= config.ellipse_fit_tolerance * 1.5
+        and 0.84 <= result.area_ratio <= 1.16
         and result.confidence >= config.ellipse_confidence_threshold
     )
 
@@ -203,7 +221,8 @@ def _is_rectangle_candidate(result: RectangleFitResult | None, config: HybridVec
         return False
     return (
         result.mean_error <= config.primitive_fit_error_threshold
-        and 0.78 <= result.area_ratio <= 1.22
+        and result.max_error <= config.primitive_fit_error_threshold * 1.6
+        and 0.84 <= result.area_ratio <= 1.16
         and result.confidence >= config.rectangle_confidence_threshold
     )
 
@@ -216,10 +235,314 @@ def _is_rounded_rectangle_candidate(result: RoundedRectangleFitResult | None, co
     radius_ratio = result.primitive.corner_radius / max(1e-6, min_dimension)
     return (
         result.mean_error <= config.primitive_fit_error_threshold
-        and 0.72 <= result.area_ratio <= 1.28
-        and 0.06 <= radius_ratio <= 0.30
+        and result.max_error <= config.primitive_fit_error_threshold * 1.65
+        and 0.8 <= result.area_ratio <= 1.2
+        and 0.08 <= radius_ratio <= 0.28
         and result.confidence >= config.rounded_rectangle_confidence_threshold
     )
+
+
+def fit_freeform_segments(
+    points: list[Point],
+    config: HybridVectorizerConfig,
+    contour: ClosedContour | None = None,
+) -> list[Segment]:
+    if len(points) < 2:
+        return []
+
+    working_points = _prepare_freeform_points(points, config, contour=contour)
+    return _fit_cubic_freeform_segments(working_points, config)
+
+
+def _prepare_freeform_points(
+    points: list[Point],
+    config: HybridVectorizerConfig,
+    contour: ClosedContour | None,
+) -> list[Point]:
+    working = merge_near_duplicate_points(
+        points,
+        merge_distance=max(0.01, config.merge_distance * 0.35),
+    )
+    working = _simplify_closed_points_for_fit(working, config)
+    if contour is not None and _is_shadow_like_contour(contour):
+        working = _simplify_shadow_points(working, config)
+    return working if len(working) >= 3 else points
+
+
+def _fit_cubic_freeform_segments(points: list[Point], config: HybridVectorizerConfig) -> list[Segment]:
+    if len(points) < 2:
+        return []
+
+    corner_candidates = classify_contour_corners(points, config)
+    anchor_indices = _build_freeform_anchor_indices(points, corner_candidates)
+    if len(anchor_indices) < 2:
+        return _fit_closed_cubic_curve(points, error=min(0.5, config.bezier_fit_tolerance))
+
+    segments: list[Segment] = []
+    for anchor_offset, start_index in enumerate(anchor_indices):
+        end_index = anchor_indices[(anchor_offset + 1) % len(anchor_indices)]
+        span = _closed_span(points, start_index, end_index)
+        span = merge_near_duplicate_points(
+            span,
+            merge_distance=max(0.01, config.merge_distance * 0.3),
+            closed=False,
+        )
+        if len(span) < 2:
+            continue
+        segments.extend(_fit_cubic_span(span, error=min(0.5, config.bezier_fit_tolerance)))
+
+    if segments:
+        return segments
+    return _fit_closed_cubic_curve(points, error=min(0.5, config.bezier_fit_tolerance))
+
+
+def _build_freeform_anchor_indices(
+    points: list[Point],
+    corner_candidates: dict[int, CornerCandidate],
+) -> list[int]:
+    count = len(points)
+    if count < 2:
+        return []
+
+    hard_corner_indices = _detect_hard_corner_indices(
+        points,
+        min_turn_degrees=HARD_CORNER_MIN_TURN_DEGREES,
+    )
+    anchors = sorted(
+        index
+        for index in range(count)
+        if corner_candidates.get(index, None) is not None and corner_candidates[index].classification == "preserve_sharp"
+        or index in hard_corner_indices
+    )
+    if not anchors:
+        return []
+    if len(anchors) == 1:
+        return sorted({anchors[0], (anchors[0] + count // 2) % count})
+    return anchors
+
+
+def _fit_closed_cubic_curve(points: list[Point], error: float) -> list[Segment]:
+    reduced_points = _reduce_points_for_fit_curve(points, closed=True)
+    closed_points = np.asarray([(point.x, point.y) for point in reduced_points], dtype=np.float64)
+    if np.linalg.norm(closed_points[0] - closed_points[-1]) > 1e-6:
+        closed_points = np.vstack([closed_points, closed_points[0]])
+    return _segments_from_fit_curve(
+        fit_curve(closed_points, error=max(FITCURVES_MIN_ERROR, max(1e-6, float(error)))),
+        closed=True,
+    )
+
+
+def _fit_cubic_span(points: list[Point], error: float) -> list[Segment]:
+    if len(points) < 2:
+        return []
+    if len(points) == 2:
+        return [_line_as_cubic(points[0], points[1])]
+
+    reduced_points = _reduce_points_for_fit_curve(points, closed=False)
+    coords = np.asarray([(point.x, point.y) for point in reduced_points], dtype=np.float64)
+    fitted = fit_curve(coords, error=max(FITCURVES_MIN_ERROR, max(1e-6, float(error))))
+    if not fitted:
+        return [_line_as_cubic(points[0], points[-1])]
+    return _segments_from_fit_curve(fitted, closed=False)
+
+
+def _segments_from_fit_curve(
+    cubic_segments: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    closed: bool,
+) -> list[Segment]:
+    cubic_segments = _merge_micro_cubic_segments(
+        cubic_segments,
+        min_length=FITCURVES_MIN_SEGMENT_LENGTH,
+        closed=closed,
+    )
+    return [
+        SegmentBezierCubic(
+            start=Point(float(segment[0][0]), float(segment[0][1])),
+            control1=Point(float(segment[1][0]), float(segment[1][1])),
+            control2=Point(float(segment[2][0]), float(segment[2][1])),
+            end=Point(float(segment[3][0]), float(segment[3][1])),
+        )
+        for segment in cubic_segments
+    ]
+
+
+def _is_shadow_like_contour(contour: ClosedContour) -> bool:
+    if contour.is_hole:
+        return False
+    bbox = contour.bbox
+    if bbox.width <= 0.0 or bbox.height <= 0.0:
+        return False
+    aspect_ratio = bbox.width / bbox.height
+    area_ratio = contour.area / max(1e-6, bbox.width * bbox.height)
+    return aspect_ratio >= 1.7 and 0.45 <= area_ratio <= 0.92
+
+
+def _simplify_shadow_points(points: list[Point], config: HybridVectorizerConfig) -> list[Point]:
+    corner_candidates = classify_contour_corners(points, config)
+    hard_corner_indices = _detect_hard_corner_indices(
+        points,
+        min_turn_degrees=HARD_CORNER_MIN_TURN_DEGREES,
+    )
+    protected_indices = {
+        index
+        for index, candidate in corner_candidates.items()
+        if candidate.classification == "preserve_sharp"
+    }
+    protected_indices |= hard_corner_indices
+    simplified = simplify_closed_preserving_indices(
+        points,
+        tolerance=2.0,
+        protected_indices=protected_indices,
+    )
+    simplified = merge_near_duplicate_points(
+        simplified,
+        merge_distance=max(0.01, config.merge_distance * 0.35),
+    )
+    if len(simplified) < 4:
+        return points
+    return simplified
+
+
+def _simplify_closed_points_for_fit(points: list[Point], config: HybridVectorizerConfig) -> list[Point]:
+    if len(points) <= 4:
+        return points
+
+    corner_candidates = classify_contour_corners(points, config)
+    hard_corner_indices = _detect_hard_corner_indices(
+        points,
+        min_turn_degrees=HARD_CORNER_MIN_TURN_DEGREES,
+    )
+    protected_indices = {
+        index
+        for index, candidate in corner_candidates.items()
+        if candidate.classification == "preserve_sharp"
+    }
+    protected_indices |= hard_corner_indices
+    reduced = simplify_closed_preserving_indices(
+        points,
+        tolerance=FITCURVES_PRE_RDP_EPSILON,
+        protected_indices=protected_indices,
+    )
+    reduced = merge_near_duplicate_points(
+        reduced,
+        merge_distance=max(0.01, config.merge_distance * 0.3),
+    )
+    return reduced if len(reduced) >= 4 else points
+
+
+def _reduce_points_for_fit_curve(points: list[Point], closed: bool) -> list[Point]:
+    if len(points) <= 3:
+        return points
+
+    reduced = (
+        douglas_peucker_closed(points, tolerance=FITCURVES_PRE_RDP_EPSILON)
+        if closed
+        else douglas_peucker_open(points, tolerance=FITCURVES_PRE_RDP_EPSILON)
+    )
+    reduced = merge_near_duplicate_points(
+        reduced,
+        merge_distance=max(0.01, FITCURVES_PRE_RDP_EPSILON * 0.15),
+        closed=closed,
+    )
+    minimum_points = 4 if closed else 2
+    return reduced if len(reduced) >= minimum_points else points
+
+
+def _merge_micro_cubic_segments(
+    cubic_segments: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    min_length: float,
+    closed: bool,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    segments = [
+        tuple(np.asarray(control, dtype=np.float64).copy() for control in segment)
+        for segment in cubic_segments
+    ]
+    if len(segments) <= 1:
+        return segments
+
+    index = 0
+    while len(segments) > 1 and index < len(segments):
+        if _cubic_chord_length(segments[index]) >= min_length:
+            index += 1
+            continue
+
+        prev_exists = closed or index > 0
+        next_exists = closed or index < len(segments) - 1
+        if not prev_exists and not next_exists:
+            break
+
+        prev_index = (index - 1) % len(segments)
+        next_index = (index + 1) % len(segments)
+        if prev_exists and next_exists:
+            merge_with_prev = _cubic_chord_length(segments[prev_index]) <= _cubic_chord_length(segments[next_index])
+        else:
+            merge_with_prev = prev_exists
+
+        if merge_with_prev:
+            if closed and index == 0:
+                merged = _merge_adjacent_cubic_segments(segments[-1], segments[0])
+                segments = [merged, *segments[1:-1]]
+            else:
+                merged = _merge_adjacent_cubic_segments(segments[index - 1], segments[index])
+                segments[index - 1 : index + 1] = [merged]
+                index = max(0, index - 1)
+        else:
+            if closed and index == len(segments) - 1:
+                merged = _merge_adjacent_cubic_segments(segments[index], segments[0])
+                segments = [merged, *segments[1:index]]
+                index = 0
+            else:
+                merged = _merge_adjacent_cubic_segments(segments[index], segments[index + 1])
+                segments[index : index + 2] = [merged]
+        index = max(0, min(index, len(segments) - 1))
+    return segments
+
+
+def _merge_adjacent_cubic_segments(
+    left: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    right: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        left[0].copy(),
+        left[1].copy(),
+        right[2].copy(),
+        right[3].copy(),
+    )
+
+
+def _cubic_chord_length(segment: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]) -> float:
+    return float(np.linalg.norm(segment[3] - segment[0]))
+
+
+def _detect_hard_corner_indices(points: list[Point], min_turn_degrees: float) -> set[int]:
+    if len(points) < 3:
+        return set()
+
+    hard_corners: set[int] = set()
+    for index, point in enumerate(points):
+        prev_point = points[index - 1]
+        next_point = points[(index + 1) % len(points)]
+        interior_angle = _corner_angle_degrees(prev_point, point, next_point)
+        turn_angle = max(0.0, 180.0 - interior_angle)
+        if turn_angle > min_turn_degrees:
+            hard_corners.add(index)
+    return hard_corners
+
+
+def _corner_angle_degrees(prev_point: Point, point: Point, next_point: Point) -> float:
+    ux = prev_point.x - point.x
+    uy = prev_point.y - point.y
+    vx = next_point.x - point.x
+    vy = next_point.y - point.y
+
+    mag_u = float(np.hypot(ux, uy))
+    mag_v = float(np.hypot(vx, vy))
+    if mag_u <= 1e-9 or mag_v <= 1e-9:
+        return 180.0
+
+    dot = (ux * vx + uy * vy) / (mag_u * mag_v)
+    dot = max(-1.0, min(1.0, dot))
+    return degrees(acos(dot))
 
 
 def _fit_curve_segments(points: list[Point], config: HybridVectorizerConfig) -> list[Segment]:
@@ -316,25 +639,20 @@ def _fit_open_span(points: list[Point], config: HybridVectorizerConfig) -> list[
     if len(points) < 2 or _distance(points[0], points[-1]) <= 1e-6:
         return []
 
+    points = _simplify_open_span(points, config)
+    max_curve_error = min(0.5, config.bezier_fit_tolerance)
     if len(points) <= 2:
-        return [SegmentLine(start=points[0], end=points[-1])]
-
-    if _line_fit_error(points) <= config.line_fit_tolerance:
-        return [SegmentLine(start=points[0], end=points[-1])]
-
-    arc_segment = _fit_arc_span(points, config)
-    if arc_segment is not None:
-        return [arc_segment]
-
-    quadratic, quadratic_error, quadratic_split = _fit_quadratic_bezier(points)
-    if quadratic is not None and quadratic_error <= config.quadratic_fit_tolerance:
-        return [quadratic]
+        return [_line_as_cubic(points[0], points[-1])]
 
     cubic, cubic_error, cubic_split = _fit_cubic_bezier(points)
-    if cubic is not None and cubic_error <= config.bezier_fit_tolerance:
+    if cubic is not None and cubic_error <= max_curve_error:
         return [cubic]
 
-    split_index = quadratic_split if quadratic_error <= cubic_error else cubic_split
+    quadratic, quadratic_error, quadratic_split = _fit_quadratic_bezier(points)
+    if quadratic is not None and quadratic_error <= max_curve_error:
+        return [_quadratic_to_cubic(quadratic)]
+
+    split_index = cubic_split if cubic_error <= quadratic_error else quadratic_split
     if split_index <= 1 or split_index >= len(points) - 1:
         return _fit_catmull_rom_chain(points)
 
@@ -347,87 +665,61 @@ def _fit_quadratic_bezier(points: list[Point]) -> tuple[SegmentBezierQuadratic |
     if len(points) < 3:
         return None, float("inf"), -1
 
-    ts = _chord_length_parameterize(points)
-    p0 = points[0]
-    p2 = points[-1]
-    denom = 0.0
-    accum_x = 0.0
-    accum_y = 0.0
-    for point, t in zip(points[1:-1], ts[1:-1]):
-        basis = 2.0 * (1.0 - t) * t
-        if basis <= 1e-6:
-            continue
-        base_x = (1.0 - t) * (1.0 - t) * p0.x + t * t * p2.x
-        base_y = (1.0 - t) * (1.0 - t) * p0.y + t * t * p2.y
-        accum_x += basis * (point.x - base_x)
-        accum_y += basis * (point.y - base_y)
-        denom += basis * basis
+    parameters = _centripetal_parameterize(points)
+    best_bezier: SegmentBezierQuadratic | None = None
+    best_error = float("inf")
+    best_split = -1
 
-    if denom <= 1e-8:
-        return None, float("inf"), -1
+    for _ in range(4):
+        bezier = _solve_quadratic_bezier(points, parameters)
+        if bezier is None:
+            break
 
-    control = Point(accum_x / denom, accum_y / denom)
-    bezier = SegmentBezierQuadratic(start=p0, control=control, end=p2)
+        max_error, split_index = _bezier_max_error(points, parameters, lambda t: _evaluate_quadratic_bezier(bezier, t))
+        if max_error < best_error:
+            best_bezier = bezier
+            best_error = max_error
+            best_split = split_index
 
-    max_error = 0.0
-    split_index = len(points) // 2
-    for index, (point, t) in enumerate(zip(points, ts)):
-        sample = _evaluate_quadratic_bezier(bezier, t)
-        error = _distance(point, sample)
-        if error > max_error:
-            max_error = error
-            split_index = index
-    return bezier, max_error, split_index
+        refined = _refine_parameters(points, parameters, lambda t: _evaluate_quadratic_bezier(bezier, t))
+        if refined is None or _parameter_shift(refined, parameters) <= 1e-3:
+            break
+        parameters = refined
+
+    return best_bezier, best_error, best_split
 
 
 def _fit_cubic_bezier(points: list[Point]) -> tuple[SegmentBezierCubic | None, float, int]:
     if len(points) < 4:
         return None, float("inf"), -1
 
-    ts = _chord_length_parameterize(points)
-    p0 = points[0]
-    p3 = points[-1]
-    basis_rows = []
-    rhs_x = []
-    rhs_y = []
-    for point, t in zip(points, ts):
-        omt = 1.0 - t
-        b0 = omt * omt * omt
-        b1 = 3.0 * omt * omt * t
-        b2 = 3.0 * omt * t * t
-        b3 = t * t * t
-        basis_rows.append([b1, b2])
-        rhs_x.append(point.x - (b0 * p0.x + b3 * p3.x))
-        rhs_y.append(point.y - (b0 * p0.y + b3 * p3.y))
+    parameters = _centripetal_parameterize(points)
+    best_bezier: SegmentBezierCubic | None = None
+    best_error = float("inf")
+    best_split = -1
 
-    matrix = np.asarray(basis_rows, dtype=np.float64)
-    try:
-        ctrl_x, *_ = np.linalg.lstsq(matrix, np.asarray(rhs_x, dtype=np.float64), rcond=None)
-        ctrl_y, *_ = np.linalg.lstsq(matrix, np.asarray(rhs_y, dtype=np.float64), rcond=None)
-    except np.linalg.LinAlgError:
-        return None, float("inf"), -1
+    for _ in range(4):
+        bezier = _solve_cubic_bezier(points, parameters)
+        if bezier is None:
+            break
 
-    bezier = SegmentBezierCubic(
-        start=p0,
-        control1=Point(float(ctrl_x[0]), float(ctrl_y[0])),
-        control2=Point(float(ctrl_x[1]), float(ctrl_y[1])),
-        end=p3,
-    )
+        max_error, split_index = _bezier_max_error(points, parameters, lambda t: _evaluate_cubic_bezier(bezier, t))
+        if max_error < best_error:
+            best_bezier = bezier
+            best_error = max_error
+            best_split = split_index
 
-    max_error = 0.0
-    split_index = len(points) // 2
-    for index, (point, t) in enumerate(zip(points, ts)):
-        sample = _evaluate_cubic_bezier(bezier, t)
-        error = _distance(point, sample)
-        if error > max_error:
-            max_error = error
-            split_index = index
-    return bezier, max_error, split_index
+        refined = _refine_parameters(points, parameters, lambda t: _evaluate_cubic_bezier(bezier, t))
+        if refined is None or _parameter_shift(refined, parameters) <= 1e-3:
+            break
+        parameters = refined
+
+    return best_bezier, best_error, best_split
 
 
 def _fit_catmull_rom_chain(points: list[Point]) -> list[Segment]:
     if len(points) <= 2:
-        return [SegmentLine(start=points[0], end=points[-1])]
+        return [_line_as_cubic(points[0], points[-1])]
 
     segments: list[Segment] = []
     for index in range(len(points) - 1):
@@ -439,6 +731,32 @@ def _fit_catmull_rom_chain(points: list[Point]) -> list[Segment]:
         c2 = Point(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0)
         segments.append(SegmentBezierCubic(start=p1, control1=c1, control2=c2, end=p2))
     return segments
+
+
+def _line_as_cubic(start: Point, end: Point) -> SegmentBezierCubic:
+    dx = end.x - start.x
+    dy = end.y - start.y
+    return SegmentBezierCubic(
+        start=start,
+        control1=Point(start.x + dx / 3.0, start.y + dy / 3.0),
+        control2=Point(start.x + (2.0 * dx) / 3.0, start.y + (2.0 * dy) / 3.0),
+        end=end,
+    )
+
+
+def _quadratic_to_cubic(segment: SegmentBezierQuadratic) -> SegmentBezierCubic:
+    return SegmentBezierCubic(
+        start=segment.start,
+        control1=Point(
+            segment.start.x + (2.0 / 3.0) * (segment.control.x - segment.start.x),
+            segment.start.y + (2.0 / 3.0) * (segment.control.y - segment.start.y),
+        ),
+        control2=Point(
+            segment.end.x + (2.0 / 3.0) * (segment.control.x - segment.end.x),
+            segment.end.y + (2.0 / 3.0) * (segment.control.y - segment.end.y),
+        ),
+        end=segment.end,
+    )
 
 
 def _fit_arc_span(points: list[Point], config: HybridVectorizerConfig) -> Segment | None:
@@ -506,6 +824,129 @@ def _chord_length_parameterize(points: list[Point]) -> list[float]:
     return [value / total for value in distances]
 
 
+def _centripetal_parameterize(points: list[Point]) -> list[float]:
+    distances = [0.0]
+    total = 0.0
+    for index in range(1, len(points)):
+        total += max(1e-6, _distance(points[index - 1], points[index]) ** 0.5)
+        distances.append(total)
+    if total <= 0.0:
+        return _chord_length_parameterize(points)
+    return [value / total for value in distances]
+
+
+def _solve_quadratic_bezier(points: list[Point], parameters: list[float]) -> SegmentBezierQuadratic | None:
+    p0 = points[0]
+    p2 = points[-1]
+    denom = 0.0
+    accum_x = 0.0
+    accum_y = 0.0
+    for point, t in zip(points[1:-1], parameters[1:-1]):
+        basis = 2.0 * (1.0 - t) * t
+        if basis <= 1e-6:
+            continue
+        base_x = (1.0 - t) * (1.0 - t) * p0.x + t * t * p2.x
+        base_y = (1.0 - t) * (1.0 - t) * p0.y + t * t * p2.y
+        accum_x += basis * (point.x - base_x)
+        accum_y += basis * (point.y - base_y)
+        denom += basis * basis
+    if denom <= 1e-8:
+        return None
+    return SegmentBezierQuadratic(start=p0, control=Point(accum_x / denom, accum_y / denom), end=p2)
+
+
+def _solve_cubic_bezier(points: list[Point], parameters: list[float]) -> SegmentBezierCubic | None:
+    p0 = points[0]
+    p3 = points[-1]
+    basis_rows = []
+    rhs_x = []
+    rhs_y = []
+    for point, t in zip(points[1:-1], parameters[1:-1]):
+        omt = 1.0 - t
+        b0 = omt * omt * omt
+        b1 = 3.0 * omt * omt * t
+        b2 = 3.0 * omt * t * t
+        b3 = t * t * t
+        basis_rows.append([b1, b2])
+        rhs_x.append(point.x - (b0 * p0.x + b3 * p3.x))
+        rhs_y.append(point.y - (b0 * p0.y + b3 * p3.y))
+
+    matrix = np.asarray(basis_rows, dtype=np.float64)
+    if matrix.shape[0] < 2:
+        return None
+    try:
+        ctrl_x, *_ = np.linalg.lstsq(matrix, np.asarray(rhs_x, dtype=np.float64), rcond=None)
+        ctrl_y, *_ = np.linalg.lstsq(matrix, np.asarray(rhs_y, dtype=np.float64), rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    if len(ctrl_x) < 2 or len(ctrl_y) < 2:
+        return None
+
+    return SegmentBezierCubic(
+        start=p0,
+        control1=Point(float(ctrl_x[0]), float(ctrl_y[0])),
+        control2=Point(float(ctrl_x[1]), float(ctrl_y[1])),
+        end=p3,
+    )
+
+
+def _bezier_max_error(
+    points: list[Point],
+    parameters: list[float],
+    evaluator: Callable[[float], Point],
+) -> tuple[float, int]:
+    max_error = 0.0
+    split_index = len(points) // 2
+    for index, (point, t) in enumerate(zip(points, parameters)):
+        sample = evaluator(t)
+        error = _distance(point, sample)
+        if error > max_error:
+            max_error = error
+            split_index = index
+    return max_error, split_index
+
+
+def _refine_parameters(
+    points: list[Point],
+    parameters: list[float],
+    evaluator: Callable[[float], Point],
+) -> list[float] | None:
+    if len(points) <= 2:
+        return parameters
+
+    sample_count = max(32, len(points) * 6)
+    sample_ts = np.linspace(0.0, 1.0, sample_count + 1, dtype=np.float64)
+    samples = [evaluator(float(t)) for t in sample_ts]
+    refined = [0.0]
+    remaining = len(points) - 2
+
+    for point in points[1:-1]:
+        lower = refined[-1] + 1e-4
+        upper = 1.0 - remaining * 1e-4
+        best_t = None
+        best_error = float("inf")
+        for candidate_t, sample in zip(sample_ts, samples):
+            value = float(candidate_t)
+            if value < lower or value > upper:
+                continue
+            error = _distance(point, sample)
+            if error < best_error:
+                best_error = error
+                best_t = value
+        if best_t is None:
+            return None
+        refined.append(best_t)
+        remaining -= 1
+
+    refined.append(1.0)
+    return refined if len(refined) == len(parameters) else None
+
+
+def _parameter_shift(left: list[float], right: list[float]) -> float:
+    return max(abs(a - b) for a, b in zip(left, right))
+
+
 def _evaluate_quadratic_bezier(bezier: SegmentBezierQuadratic, t: float) -> Point:
     omt = 1.0 - t
     x = omt * omt * bezier.start.x + 2.0 * omt * t * bezier.control.x + t * t * bezier.end.x
@@ -555,8 +996,18 @@ def _distance(a: Point, b: Point) -> float:
     return float(np.hypot(a.x - b.x, a.y - b.y))
 
 
+def _simplify_open_span(points: list[Point], config: HybridVectorizerConfig) -> list[Point]:
+    if len(points) <= 3:
+        return points
+
+    tolerance = max(0.18, config.simplify_tolerance * 0.35)
+    reduced = douglas_peucker_open(points, tolerance=tolerance)
+    reduced = merge_near_duplicate_points(reduced, merge_distance=max(0.01, config.merge_distance * 0.45), closed=False)
+    return reduced if len(reduced) >= 2 else points
+
+
 def _fit_safe_spline_loop(contour: ClosedContour, config: HybridVectorizerConfig, polarity: str) -> Loop | None:
-    reduced = douglas_peucker_closed(contour.points, tolerance=max(0.35, config.simplify_tolerance * 0.45))
+    reduced = douglas_peucker_closed(contour.points, tolerance=max(0.4, config.simplify_tolerance * 0.55))
     reduced = merge_near_duplicate_points(reduced, merge_distance=max(0.01, config.merge_distance * 0.5))
     if len(reduced) < 4:
         return None
@@ -570,12 +1021,12 @@ def _fit_safe_spline_loop(contour: ClosedContour, config: HybridVectorizerConfig
 
     segments: list[Segment] = []
     count = len(reduced)
-    tension = 0.12
+    tension = 0.16
     for index in range(count):
         start = reduced[index]
         end = reduced[(index + 1) % count]
         if index in sharp_corners or (index + 1) % count in sharp_corners:
-            segments.append(SegmentLine(start=start, end=end))
+            segments.append(_line_as_cubic(start, end))
             continue
 
         prev_point = reduced[index - 1]

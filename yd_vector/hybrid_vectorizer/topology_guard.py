@@ -84,7 +84,7 @@ def validate_shape_topology(shape: Shape, region_outer: ClosedContour, region_ho
     return True
 
 
-def sample_loop_points(loop: Loop, samples_per_curve: int = 12) -> list[Point]:
+def sample_loop_points(loop: Loop, samples_per_curve: int = 18) -> list[Point]:
     if not loop.segments:
         return []
 
@@ -162,16 +162,20 @@ def polygons_intersect(left: list[Point], right: list[Point]) -> bool:
 
 
 def point_in_polygon(point: Point, polygon: list[Point]) -> bool:
-    inside = False
+    winding_number = 0
     count = len(polygon)
     for index in range(count):
         a = polygon[index]
         b = polygon[(index + 1) % count]
-        if ((a.y > point.y) != (b.y > point.y)) and (
-            point.x < (b.x - a.x) * (point.y - a.y) / max(1e-9, b.y - a.y) + a.x
-        ):
-            inside = not inside
-    return inside
+        if _point_on_segment(point, a, b):
+            return True
+
+        if a.y <= point.y:
+            if b.y > point.y and _is_left(a, b, point) > 0.0:
+                winding_number += 1
+        elif b.y <= point.y and _is_left(a, b, point) < 0.0:
+            winding_number -= 1
+    return winding_number != 0
 
 
 def polygon_centroid(points: list[Point]) -> Point | None:
@@ -361,3 +365,11 @@ def _shares_endpoint(a0: Point, a1: Point, b0: Point, b1: Point) -> bool:
         or distance(a1, b0) <= 1e-6
         or distance(a1, b1) <= 1e-6
     )
+
+
+def _is_left(a: Point, b: Point, point: Point) -> float:
+    return (b.x - a.x) * (point.y - a.y) - (point.x - a.x) * (b.y - a.y)
+
+
+def _point_on_segment(point: Point, start: Point, end: Point) -> bool:
+    return abs(_is_left(start, end, point)) <= 1e-8 and _on_segment(start, point, end)

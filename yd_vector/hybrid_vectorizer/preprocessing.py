@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -13,6 +14,10 @@ from yd_vector.hybrid_vectorizer.config import HybridVectorizerConfig
 class PreprocessResult:
     width: int
     height: int
+    original_width: int
+    original_height: int
+    coordinate_scale_x: float
+    coordinate_scale_y: float
     color_image: np.ndarray
     alpha: np.ndarray
     valid_mask: np.ndarray
@@ -25,6 +30,7 @@ class PreprocessResult:
 
 def preprocess_image(image_path: str | Path, config: HybridVectorizerConfig) -> PreprocessResult:
     rgba = Image.open(image_path).convert("RGBA")
+    original_width, original_height = rgba.size
     rgba = _resize_longest_side(rgba, config.target_size)
 
     alpha = np.asarray(rgba.getchannel("A"), dtype=np.float32) / 255.0
@@ -35,10 +41,8 @@ def preprocess_image(image_path: str | Path, config: HybridVectorizerConfig) -> 
     rgb = np.asarray(color_image, dtype=np.uint8)
     valid_mask = alpha > 1e-3
     grayscale_image = image.convert("L")
-    if config.preblur_radius > 0.0:
-        grayscale_image = grayscale_image.filter(ImageFilter.GaussianBlur(radius=float(config.preblur_radius)))
-
     grayscale = np.asarray(grayscale_image, dtype=np.uint8)
+    grayscale = _denoise_grayscale(grayscale, config)
     threshold = int(config.threshold if config.threshold is not None else otsu_threshold(grayscale))
     threshold = max(0, min(255, threshold + int(config.threshold_bias)))
 
@@ -57,9 +61,15 @@ def preprocess_image(image_path: str | Path, config: HybridVectorizerConfig) -> 
     )
 
     height, width = grayscale.shape
+    scale_x = float(original_width) / max(1.0, float(width))
+    scale_y = float(original_height) / max(1.0, float(height))
     return PreprocessResult(
         width=width,
         height=height,
+        original_width=original_width,
+        original_height=original_height,
+        coordinate_scale_x=scale_x,
+        coordinate_scale_y=scale_y,
         color_image=rgb,
         alpha=alpha.astype(np.float32),
         valid_mask=valid_mask.astype(bool),
@@ -112,8 +122,13 @@ def _resize_longest_side(image: Image.Image, target_size: int | None) -> Image.I
 
     scale = target_size / float(longest_side)
     new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-    resampling = getattr(Image, "Resampling", Image)
-    return image.resize(new_size, resampling.LANCZOS)
+    if new_size == image.size:
+        return image
+
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(rgba, new_size, interpolation=interpolation)
+    return Image.fromarray(resized, mode="RGBA")
 
 
 def _build_foreground_field(grayscale: np.ndarray, alpha: np.ndarray, config: HybridVectorizerConfig) -> np.ndarray:
@@ -133,6 +148,63 @@ def _threshold_to_foreground_level(threshold: int, invert: bool) -> float:
     if invert:
         return float(threshold) / 255.0
     return float(255 - threshold) / 255.0
+
+
+def _denoise_grayscale(grayscale: np.ndarray, config: HybridVectorizerConfig) -> np.ndarray:
+    current = np.asarray(grayscale, dtype=np.uint8)
+    if config.bilateral_filter_diameter > 1 and config.bilateral_sigma_color > 0.0 and config.bilateral_sigma_space > 0.0:
+        current = _apply_bilateral_filter(
+            current,
+            diameter=config.bilateral_filter_diameter,
+            sigma_color=float(config.bilateral_sigma_color),
+            sigma_space=float(config.bilateral_sigma_space),
+        )
+    if config.preblur_radius > 0.0:
+        current = np.asarray(
+            Image.fromarray(current, mode="L").filter(ImageFilter.GaussianBlur(radius=float(config.preblur_radius))),
+            dtype=np.uint8,
+        )
+    return current
+
+
+def _apply_bilateral_filter(
+    grayscale: np.ndarray,
+    diameter: int,
+    sigma_color: float,
+    sigma_space: float,
+) -> np.ndarray:
+    diameter = max(1, int(diameter))
+    if diameter % 2 == 0:
+        diameter += 1
+    if diameter <= 1:
+        return np.asarray(grayscale, dtype=np.uint8)
+
+    radius = diameter // 2
+    source = np.asarray(grayscale, dtype=np.float32)
+    padded = np.pad(source, ((radius, radius), (radius, radius)), mode="edge")
+    spatial = _bilateral_spatial_kernel(diameter, sigma_space)
+    filtered = np.empty_like(source)
+    chunk_rows = 128
+
+    for row_start in range(0, source.shape[0], chunk_rows):
+        row_end = min(source.shape[0], row_start + chunk_rows)
+        block = padded[row_start : row_end + 2 * radius, :]
+        windows = np.lib.stride_tricks.sliding_window_view(block, (diameter, diameter))
+        center = source[row_start:row_end, :][..., None, None]
+        tonal = np.exp(-((windows - center) ** 2) / max(1e-6, 2.0 * sigma_color * sigma_color))
+        weights = tonal * spatial
+        block_sum = np.sum(weights * windows, axis=(-1, -2))
+        weight_sum = np.sum(weights, axis=(-1, -2))
+        filtered[row_start:row_end, :] = block_sum / np.maximum(weight_sum, 1e-6)
+
+    return np.clip(filtered, 0.0, 255.0).astype(np.uint8)
+
+
+def _bilateral_spatial_kernel(diameter: int, sigma_space: float) -> np.ndarray:
+    radius = diameter // 2
+    grid_y, grid_x = np.mgrid[-radius : radius + 1, -radius : radius + 1]
+    kernel = np.exp(-((grid_x * grid_x + grid_y * grid_y) / max(1e-6, 2.0 * sigma_space * sigma_space)))
+    return kernel.astype(np.float32)[None, None, :, :]
 
 
 def _binary_open(mask: np.ndarray, iterations: int) -> np.ndarray:
